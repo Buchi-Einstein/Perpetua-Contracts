@@ -272,7 +272,7 @@ fn wasm_artifact_basename_is_canonical() {
 }
 
 /// **Boundary / regression guard.** Renaming the package by one character
-/// (`fluxora-streams`, `Fluxora-Stream`, etc.) must still be caught.
+/// (`fluxora-streams`, `Perpetua-Stream`, etc.) must still be caught.
 ///
 /// This test does *not* call real `cargo metadata`; it verifies the comparison
 /// logic itself against a mutated string so the guard cannot be quietly

@@ -1,4 +1,4 @@
-# Fluxora — Build Spec (v1.1)
+# Perpetua — Build Spec (v1.1)
 
 **A continuous payment streaming primitive for Soroban.**
 
@@ -38,7 +38,7 @@ Sablier or Superfluid, built natively for Stellar.
 
 ### What this is not
 
-Not a payroll app. Not a dashboard product. Fluxora is the **layer other things build on** —
+Not a payroll app. Not a dashboard product. Perpetua is the **layer other things build on** —
 payroll tools, grant programs, subscription billing, vesting schedules. The contract is the
 product; the UI is a reference implementation that proves the contract works.
 
@@ -143,7 +143,7 @@ the transaction footprint limit once a treasury has a few hundred recipients.
 
 Stream discovery is an **off-chain concern**. The contract emits events; an indexer consumes
 them and answers "show me my streams." This is exactly what the Horizon listener and Postgres
-in the Fluxora architecture are for. On-chain, a stream is only ever addressed by its ID.
+in the Perpetua architecture are for. On-chain, a stream is only ever addressed by its ID.
 
 Consequence: `create_stream` must return the new `u64` ID, and the creation event must carry
 sender, recipient, and ID so the indexer can build the mapping.
@@ -368,7 +368,7 @@ That is unacceptable UX for a payroll or grant primitive and must be engineered 
    need periodic extension regardless. Read the achievable maximum from the SDK
    (`storage().max_ttl()`), not from `LedgerInfo::max_entry_ttl`; they differ by one.
 3. **Permissionless `extend_stream_ttl`.** Anyone can pay to keep any stream alive. This lets
-   the Fluxora backend run a cheap keeper that sweeps streams approaching expiry, and it means
+   the Perpetua backend run a cheap keeper that sweeps streams approaching expiry, and it means
    a recipient is never dependent on the sender's goodwill to keep their claim readable.
    There is nothing to grief: the caller only ever *pays* rent, and TTL extension can neither
    move funds nor change stream state.
@@ -462,12 +462,12 @@ visible before it becomes an outage.
 
 | Repo | Contents |
 |---|---|
-| `Fluxora-Contracts` | Rust / Soroban. The product. |
-| `Fluxora-Backend` | TypeScript, Express, Postgres. Indexer + keeper + API. |
-| `Fluxora-Frontend` | React. Reference dashboard and recipient portal. |
+| `Perpetua-Contracts` | Rust / Soroban. The product. |
+| `Perpetua-Backend` | TypeScript, Express, Postgres. Indexer + keeper + API. |
+| `Perpetua-Frontend` | React. Reference dashboard and recipient portal. |
 
 Add a fourth as soon as the contract stabilises: **`fluxora-sdk`** (TypeScript). This is what
-integrators actually consume, and it is what makes Fluxora a primitive rather than an app. It
+integrators actually consume, and it is what makes Perpetua a primitive rather than an app. It
 should wrap contract calls, handle batch chunking, detect archived entries, and expose typed
 stream objects. Generate its types from the deployed contract's interface spec (§2.9) rather
 than hand-writing them.
@@ -539,7 +539,7 @@ weaken the audit story.
 4. **Should `transfer_recipient` be disableable at creation?** → **Yes**, via an immutable
    `transferable` flag alongside `cancellable` and `pausable`. Compliance-bound senders —
    payroll, KYC'd grant programs — need the payee pinned, and without it they could not use
-   Fluxora at all. §2.2.
+   Perpetua at all. §2.2.
 
 ---
 

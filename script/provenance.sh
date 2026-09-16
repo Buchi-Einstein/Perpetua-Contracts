@@ -2,7 +2,7 @@
 #
 # Wasm provenance — the release-integrity gate from issue #1546.
 #
-# Every deployable wasm the workspace produces gets a machine-readable manifest
+# Every deployable wasm the protocol ships gets a machine-readable manifest
 # (provenance.json) tying its bytes to the git revision, Rust toolchain,
 # soroban-sdk version, target triple and release profile, plus a SHASUMS file
 # in `sha256sum` format. `verify` re-hashes the artifacts and re-checks the
@@ -14,7 +14,9 @@
 #   script/provenance.sh verify   [release-dir]     # release gate — exit non-zero on mismatch
 #   script/provenance.sh test                       # run the tool's regression suite
 #
-# The release dir defaults to target/<FLUXORA_WASM_TARGET>/release
+# Each contract is its own standalone Cargo project (no shared workspace).
+# `build` compiles every contract under contracts/ and manifests them all.
+# The release dir defaults to contracts/stream/target/<FLUXORA_WASM_TARGET>/release
 # (FLUXORA_WASM_TARGET defaults to wasm32v1-none, per rust-toolchain.toml).
 # All commands are idempotent: re-run after a rebuild to regenerate, or after
 # fixing whatever drifted to re-verify.
@@ -23,7 +25,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${FLUXORA_WASM_TARGET:-wasm32v1-none}"
-RELEASE_DIR="${2:-$ROOT/target/$TARGET/release}"
+RELEASE_DIR="${2:-$ROOT/contracts/stream/target/$TARGET/release}"
 TOOL_DIR="$ROOT/tools/provenance"
 TOOL="$TOOL_DIR/target/release/fluxora-provenance"
 
@@ -31,11 +33,18 @@ build_tool() {
   (cd "$TOOL_DIR" && cargo build --release --quiet)
 }
 
+build_contracts() {
+  for dir in "$ROOT"/contracts/*/; do
+    echo "== $(basename "$dir") =="
+    (cd "$dir" && cargo build --target "$TARGET" --release)
+  done
+}
+
 cmd="${1:-help}"
 case "$cmd" in
   build)
     build_tool
-    cargo build --workspace --target "$TARGET" --release
+    build_contracts
     "$TOOL" generate "$RELEASE_DIR" --target "$TARGET"
     "$TOOL" verify "$RELEASE_DIR" --target "$TARGET"
     echo "provenance ok — $RELEASE_DIR/provenance.json is current"

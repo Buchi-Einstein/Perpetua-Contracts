@@ -59,7 +59,7 @@ check() {
 }
 
 echo "════════════════════════════════════════════════════════════════════════"
-echo " Fluxora — Release Dry-Run Regression Suite"
+echo " Perpetua — Release Dry-Run Regression Suite"
 echo "════════════════════════════════════════════════════════════════════════"
 
 # Create mock WASM artifacts for testing

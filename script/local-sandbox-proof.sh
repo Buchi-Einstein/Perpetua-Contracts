@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Build, deploy, initialize, query, and tear down Fluxora in an isolated
+# Build, deploy, initialize, query, and tear down Perpetua in an isolated
 # standalone Soroban network. No testnet identities, credentials, or funds are
 # used; all accounts are generated in a temporary stellar CLI home.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+STREAM_DIR="$ROOT/contracts/stream"
 cd "$ROOT"
 started=$SECONDS
 
 IMAGE="${SOROBAN_SANDBOX_IMAGE:-stellar/quickstart:testing}"
 CONTAINER="fluxora-soroban-sandbox-$$"
 CLI_HOME=$(mktemp -d)
-WASM="target/wasm32v1-none/release/fluxora_stream.wasm"
+WASM="$STREAM_DIR/target/wasm32v1-none/release/fluxora_stream.wasm"
 RPC_URL="http://127.0.0.1:8000/soroban/rpc"
 FRIENDBOT_URL="http://127.0.0.1:8000/friendbot"
 NETWORK_PASSPHRASE="Standalone Network ; February 2017"
@@ -26,7 +27,10 @@ command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 command -v stellar >/dev/null || { echo "stellar CLI is required" >&2; exit 2; }
 
 echo "== build =="
-cargo build -p fluxora-stream --target wasm32v1-none --release
+(
+  cd "$STREAM_DIR"
+  cargo build --target wasm32v1-none --release
+)
 checksum=$(sha256sum "$WASM" | awk '{print $1}')
 size=$(stat -c%s "$WASM")
 echo "wasm: $WASM"

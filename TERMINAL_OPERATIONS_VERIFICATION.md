@@ -334,7 +334,7 @@ For questions about this test suite:
 ## Version
 
 - **Test Suite Version**: 1.0
-- **Fluxora Version**: Protocol 27
+- **Perpetua Version**: Protocol 27
 - **Rust Version**: 1.97.1
 - **SDK Version**: soroban-sdk 27.0.5
 - **Date**: 2026-08-27

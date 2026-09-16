@@ -4,15 +4,15 @@ Deletion audit for the v1 rewrite. Two questions, answered in order:
 
 1. What did the disabled tests cover, and is any of it now *silently* missing
    rather than deliberately dropped?
-2. Do `Fluxora-Backend` or `Fluxora-Frontend` call into the deleted surface?
+2. Do `Perpetua-Backend` or `Perpetua-Frontend` call into the deleted surface?
 
 **Short answers.** (1) Nothing is silently missing — but the premise needs
 correcting first: `main` does not compile, so none of its tests ran, disabled or
 otherwise. (2) The backend is unaffected. **The frontend breaks completely**:
 all four of its contract calls fail against v1.
 
-Audit performed 2026-08-12 against `main` @ `75b15ca`, `Fluxora-Backend`
-`origin/main` @ `59d3538`, `Fluxora-Frontend` `origin/main` @ `86795ee`.
+Audit performed 2026-08-12 against `main` @ `75b15ca`, `Perpetua-Backend`
+`origin/main` @ `59d3538`, `Perpetua-Frontend` `origin/main` @ `86795ee`.
 
 ---
 
@@ -190,7 +190,7 @@ Two structural changes behind those signatures:
 
 ## 5. Downstream impact
 
-### Fluxora-Backend — **not affected**
+### Perpetua-Backend — **not affected**
 
 * **Zero** references to `factory`, `governance`, `timelock` or `proposal`
   anywhere in `*.ts` / `*.sql` / `*.yaml`. Dropping both contracts is safe.
@@ -199,7 +199,7 @@ Two structural changes behind those signatures:
   governance address, so it already assumes the one-contract model v1 has.
 * The indexer is **event-schema-generic**. `ContractEventRecord` is
   `{ eventId, topic: string, ledger, … }` — it ingests, de-duplicates, handles
-  forks and replays, but *nothing decodes Fluxora event payloads*. A repo-wide
+  forks and replays, but *nothing decodes Perpetua event payloads*. A repo-wide
   search for `stream_created`, `topics[0]` or `scValToNative` returns no files.
   The event renames and reshapes therefore break nothing that exists today.
 
@@ -219,7 +219,7 @@ The `streams` table is currently populated through the REST API
 (`src/routes/streams.ts` → `streamRepository`), not from chain events. The
 indexer→projection path is unbuilt, which is precisely stage 5's job.
 
-### Fluxora-Frontend — **breaks completely**
+### Perpetua-Frontend — **breaks completely**
 
 `src/lib/stellar/tx.ts` is the only file that invokes the contract. All four
 calls fail against v1:

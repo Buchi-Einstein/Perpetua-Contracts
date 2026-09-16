@@ -1,0 +1,50 @@
+# Perpetua factory contract — standalone Cargo project.
+#
+# Parameter-gated stream factory: enforces the protocol-wide policy (capacity
+# cap, minimum duration, rate bounds, allowlist, creation pause) before any
+# stream is launched, and exposes admin setters for each policy axis.
+#
+# Standalone project, no shared workspace:
+#
+#   cargo build --target wasm32v1-none --release
+#   cargo test
+
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "fluxora-factory"
+description = "Parameter-gated stream factory for Perpetua"
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hannyloveworld/Perpetua-Contracts"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = "27.0.5"
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.5", features = ["testutils"] }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true

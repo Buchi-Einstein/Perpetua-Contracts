@@ -1463,15 +1463,18 @@ mod tests {
     }
 
     fn last_contract_event(env: &Env, contract_id: &Address) -> (Symbol, Val) {
-        let events = env.events().all();
-        for i in (0..events.len()).rev() {
-            let (addr, topics, data) = events.get(i).unwrap();
-            if &addr != contract_id {
-                continue;
-            }
-            let topic_values: SVec<Val> = topics;
-            let topic = topic_values.get(0).expect("event has a topic");
+        use soroban_sdk::xdr::ContractEventBody;
+        let contract_events = env.events().all().filter_by_contract(contract_id);
+        let events = contract_events.events();
+        for event in events.iter().rev() {
+            let ContractEventBody::V0(body) = &event.body;
+            let topic: Val = body
+                .topics
+                .first()
+                .map(|t| Val::try_from_val(env, t).expect("topic converts"))
+                .expect("event has a topic");
             let symbol = Symbol::try_from_val(env, &topic).expect("topic is a symbol");
+            let data: Val = Val::try_from_val(env, &body.data).expect("data converts");
             return (symbol, data);
         }
 
@@ -1658,8 +1661,8 @@ mod tests {
 
         ctx.client.set_threshold(&3u32);
 
-        assert_eq!(ctx.client.get_threshold(), 3);
         let (topic, data) = last_contract_event(&ctx.env, &ctx.contract_id);
+        assert_eq!(ctx.client.get_threshold(), 3);
         assert_eq!(topic, symbol_short!("thr_upd"));
         let payload =
             ThresholdUpdated::try_from_val(&ctx.env, &data).expect("decodes to ThresholdUpdated");
@@ -1670,25 +1673,25 @@ mod tests {
     #[test]
     fn test_set_threshold_rejects_zero() {
         let ctx = Ctx::setup();
-        let events_before = ctx.env.events().all().len();
+        let events_before = ctx.env.events().all().events().len();
 
         let result = ctx.client.try_set_threshold(&0u32);
 
         assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
         assert_eq!(ctx.client.get_threshold(), 2);
-        assert_eq!(ctx.env.events().all().len(), events_before);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
     }
 
     #[test]
     fn test_set_threshold_rejects_above_signer_count() {
         let ctx = Ctx::setup(); // 3 signers
-        let events_before = ctx.env.events().all().len();
+        let events_before = ctx.env.events().all().events().len();
 
         let result = ctx.client.try_set_threshold(&4u32);
 
         assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
         assert_eq!(ctx.client.get_threshold(), 2);
-        assert_eq!(ctx.env.events().all().len(), events_before);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
     }
 
     #[test]
@@ -1698,28 +1701,6 @@ mod tests {
         ctx.client.set_threshold(&1u32);
 
         assert_eq!(ctx.client.get_threshold(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // set_threshold validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_set_threshold_rejects_zero() {
-        let ctx = Ctx::setup(); // 3 signers, threshold=2
-        let result = ctx.client.try_set_threshold(&0u32);
-        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
-        // Verify threshold is unchanged.
-        assert_eq!(ctx.client.get_threshold(), 2);
-    }
-
-    #[test]
-    fn test_set_threshold_rejects_above_signer_count() {
-        let ctx = Ctx::setup(); // 3 signers, threshold=2
-        let result = ctx.client.try_set_threshold(&4u32);
-        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
-        // Verify threshold is unchanged.
-        assert_eq!(ctx.client.get_threshold(), 2);
     }
 
     #[test]

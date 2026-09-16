@@ -7,7 +7,7 @@
 //!
 //! A raw token sub-invocation failure surfaces at the RPC as
 //! `Error(Contract, #N)` where `N` is the *token contract's* own discriminant.
-//! A client decoding that against Fluxora's error table would misinterpret it
+//! A client decoding that against Perpetua's error table would misinterpret it
 //! silently — e.g. token error #7 reads as `Unauthorized`.
 //!
 //! Instead, every token failure is mapped onto one of two stable stream-level

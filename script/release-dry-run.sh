@@ -21,7 +21,7 @@
 # Options:
 #   --network <name>              Target network: testnet | mainnet | futurenet | standalone (default: testnet)
 #   --rpc-url <url>               Soroban RPC URL (defaults to network standard)
-#   --wasm <path>                 Path to compiled contract WASM (default: target/wasm32v1-none/release/fluxora_stream.wasm)
+#   --wasm <path>                 Path to compiled contract WASM (default: contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm)
 #   --contract-id <id>            Target contract ID (56-char C... strkey)
 #   --source <identity|key>       Deployer / admin identity or secret key
 #   --token <address>             Initialization token address (56-char C... strkey)
@@ -64,7 +64,7 @@ fail()    { printf '   %b✗%b %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 # ── Defaults ──────────────────────────────────────────────────────────────────
 NETWORK="${NETWORK:-testnet}"
 RPC_URL="${RPC_URL:-}"
-WASM_PATH="${WASM_PATH:-target/wasm32v1-none/release/fluxora_stream.wasm}"
+WASM_PATH="${WASM_PATH:-contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm}"
 CONTRACT_ID="${CONTRACT_ID:-}"
 SOURCE="${SOURCE:-fluxora-deployer}"
 TOKEN="${TOKEN:-}"
@@ -270,7 +270,7 @@ success "Source / deployer configured: $SOURCE"
 say "Release Target & Checksum Manifest"
 cat <<MANIFEST
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ Fluxora Release Dry-Run Manifest                                             │
+│ Perpetua Release Dry-Run Manifest                                             │
 ╰──────────────────────────────────────────────────────────────────────────────╯
  Target Network     : $NETWORK
  RPC Endpoint       : $RPC_URL

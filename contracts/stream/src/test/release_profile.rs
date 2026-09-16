@@ -6,7 +6,7 @@
 
 use std::{format, fs, path::Path, string::String};
 
-const WORKSPACE_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml");
+const WORKSPACE_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 const STREAM_MANIFEST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 const TOOLCHAIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../rust-toolchain.toml");
 const CI_WORKFLOW: &str = concat!(

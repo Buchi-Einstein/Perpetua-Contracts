@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
-fluxora-provenance — wasm provenance for Fluxora contract releases
+fluxora-provenance — wasm provenance for Perpetua contract releases
 
 Usage:
   fluxora-provenance generate <release-dir> [--manifest <path>] [--workspace-root <dir>] [--target <triple>]

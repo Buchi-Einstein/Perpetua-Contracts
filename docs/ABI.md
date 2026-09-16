@@ -1,9 +1,9 @@
-# Fluxora ABI — interface of record
+# Perpetua ABI — interface of record
 
 **Status: FROZEN as of 2026-08-12, ahead of stage 5.**
 
-This document is the interface contract between `Fluxora-Contracts` and every
-consumer — `Fluxora-Backend`, `Fluxora-Frontend`, `fluxora-sdk`, and third-party
+This document is the interface contract between `Perpetua-Contracts` and every
+consumer — `Perpetua-Backend`, `Perpetua-Frontend`, `fluxora-sdk`, and third-party
 integrators. Anything not described here is not part of the interface.
 
 | | |
@@ -18,7 +18,7 @@ The deployed contract's interface has been verified byte-identical to the local
 build:
 
 ```bash
-stellar contract info interface --wasm target/wasm32v1-none/release/fluxora_stream.wasm
+stellar contract info interface --wasm contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm
 stellar contract info interface --id CBCGTSCJ… --network testnet
 ```
 
@@ -121,7 +121,7 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 13 | `StreamAlreadyPaused` | | 26 | `TokenMissing` |
 | | | | 29 | `MalformedStreamId` |
 
-`TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Fluxora's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
+`TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
 * `TokenTransferFailed` — the token contract returned a typed contract error: insufficient sender balance, pool underfunded on a payout, or the token's own authorization rules refused the call.
 * `TokenMissing` — the token address resolves to nothing (Abort / host trap); the stream references a non-deployed contract.
@@ -205,7 +205,7 @@ may emit fewer than 16 events.
 
 ## Resolved schema questions
 
-Both were open against `Fluxora-Backend` in [MIGRATION.md](MIGRATION.md) §5
+Both were open against `Perpetua-Backend` in [MIGRATION.md](MIGRATION.md) §5
 and are settled here as part of the freeze.
 
 ### 1. `streams.status` — mirror the contract's four values verbatim

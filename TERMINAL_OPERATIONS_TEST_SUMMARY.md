@@ -2,7 +2,7 @@
 
 ## Overview
 
-This PR implements comprehensive regression tests for terminal operation rejection behavior in the Fluxora stream contract. Terminal states (`Cancelled` and `Depleted`) must reject all mutating lifecycle operations with stable errors and guaranteed unchanged state.
+This PR implements comprehensive regression tests for terminal operation rejection behavior in the Perpetua stream contract. Terminal states (`Cancelled` and `Depleted`) must reject all mutating lifecycle operations with stable errors and guaranteed unchanged state.
 
 ## Design Decision
 

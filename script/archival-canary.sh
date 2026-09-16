@@ -16,7 +16,7 @@
 #     --restore   once archived, perform the restore and verify recovery
 #
 # See contracts/archival-probe/src/lib.rs for why this uses a throwaway probe
-# contract rather than a Fluxora stream.
+# contract rather than a Perpetua stream.
 
 set -euo pipefail
 
@@ -48,7 +48,7 @@ REMAINING=$((LIVE_UNTIL_LEDGER - NOW))
 
 cat <<BANNER
 ╭──────────────────────────────────────────────────────────────────────╮
-│ Fluxora — archival canary                                            │
+│ Perpetua — archival canary                                            │
 ╰──────────────────────────────────────────────────────────────────────╯
  probe        $PROBE
  planted at   ledger $PLANTED_AT_LEDGER

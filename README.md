@@ -1,12 +1,16 @@
-# Fluxora
+# Perpetua
 
-**A continuous payment streaming primitive for Soroban.**
+**Continuous payment streaming for Soroban.**
 
-Lock tokens once; have them accrue continuously to a recipient over time. The
-recipient pulls their accrued balance whenever they like.
+Deposit once, stream continuously. A sender locks a token balance with a
+schedule, value accrues to the recipient second by second, and the recipient
+pulls their earnings whenever they want. No cron, no keepers, no background
+processes — every drip is settled at the moment it is claimed.
 
-Fluxora is the layer other things build on — payroll tools, grant programs,
-subscription billing, vesting schedules. The contract is the product.
+Perpetua is a building block for anything that wants to pay slowly in the open:
+payroll rails, grant disbursement, subscription billing, vesting and revived
+savings schedules. The on-chain contract is the product; everything else in this
+project exists to build, verify and release it with integrity.
 
 | | |
 |---|---|
@@ -14,50 +18,78 @@ subscription billing, vesting schedules. The contract is the product.
 | SDK | `soroban-sdk` 27.0.5 |
 | Rust | 1.97.1, target `wasm32v1-none` |
 | Token interface | SEP-41 (USDC on Stellar has **7 decimals**) |
-| Contract size | ~47 KiB baseline; enforced by `contracts/stream/wasm-size-budget.env` |
-| Tests | 146, including property tests and a pool invariant checked after every operation |
+| Product contract size | ~47 KiB baseline; enforced by `contracts/stream/wasm-size-budget.env` |
+| Tests | ~700 across four contract crates (unit, property and integration) |
 
 > **Read [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) before relying on this.**
 > A green suite here does not mean TTL is solved — the archival *recovery* flow
 > is not yet proven against a live network. See §1 there, and the summary below.
 
----
+## The project is divided in two
+
+This repository is a single repo with two independent halves:
+
+1. **Contracts** — `contracts/`, the deployable Soroban smart contracts. Each
+   is its own standalone Cargo project with its own lockfile (no shared
+   workspace), so it can be built, tested and released independently:
+   - `contracts/stream` — the product: the streaming primitive.
+   - `contracts/factory` — policy gate: capacity cap, minimum duration, rate
+     bounds, allowlist, creation pause.
+   - `contracts/governance` — timelocked multi-sig tuning of factory policy.
+   - `contracts/archival-probe` — a deliberate throwaway that proves the
+     live-network archival/restore round trip. Never deploy it.
+2. **Tooling and automation** — `script/` (release, provenance, sandbox,
+   validation), `tools/provenance/` (the release-integrity gate), `tests/`
+   (validator test suite), `docs/` and the build spec.
+
+The halves depend on each other only through paths and the released wasm, never
+through a shared build artifact.
 
 ## Quick start
 
 ```bash
-cargo test                                    # full suite
-cargo test resource_limits -- --nocapture     # print measured resource costs
+# One line per contract crate (they are independent projects):
+(cd contracts/stream    && cargo test --all-features)
+(cd contracts/factory   && cargo test)
+(cd contracts/governance && cargo test)
+(cd contracts/archival-probe && cargo test)
+
+# Print measured resource costs for the product contract:
+(cd contracts/stream && cargo test resource_limits -- --nocapture)
 
 # Deeper randomized sweep. CI runs this nightly; worth running before a release
 # or after touching accrual.rs. Both suites have found real bugs.
-FLUXORA_FUZZ_SEEDS=200 FLUXORA_FUZZ_STEPS=300 PROPTEST_CASES=5000 cargo test --release
+FLUXORA_FUZZ_SEEDS=200 FLUXORA_FUZZ_STEPS=300 PROPTEST_CASES=5000 \
+  (cd contracts/stream && cargo test --release)
 ```
 
 ## Building and releasing
 
-The **product** contract (`contracts/stream`) builds to `fluxora_stream.wasm`.
-
 **Release artifacts come from `script/release.sh` only.** It builds exactly the
-product package, downloads nothing else, and refuses to produce an artifact if the
-archival probe's wasm would be swept in:
+product contract and refuses to ship anything else:
 
 ```bash
-script/release.sh      # -> target/wasm32v1-none/release/fluxora_stream.wasm (only)
+script/release.sh        # -> contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm
 ```
 
-> The archival probe (see below) is a workspace member so its smoke test stays
-> wired into `cargo test`, but it is deliberately excluded from release artifacts.
-> Never deploy it to mainnet. See
-> [`contracts/archival-probe/src/lib.rs`](contracts/archival-probe/src/lib.rs).
+Each contract crate builds and tests on its own:
 
----
+```bash
+cd contracts/stream      # or factory, governance, archival-probe
+cargo build              # host target check
+cargo build --target wasm32v1-none --release   # -> fluxora_<name>.wasm
+```
+
+> The archival probe is a **standalone** throwaway project with its own manifest.
+> Because it does not share an output directory with the product, it cannot leak
+> into a release; `script/release.sh` additionally verifies that only the
+> product wasm is present in its output. Never deploy the probe.
 
 ## Release integrity
 
-Every contract wasm is released with a provenance manifest tying its bytes to
-the git revision, Rust toolchain, soroban-sdk version, target triple and
-release profile, plus a SHA-256 digest per artifact (see
+Every contract wasm ships with a provenance manifest tying its bytes to the git
+revision, Rust toolchain, soroban-sdk version, target triple and release
+profile, plus a SHA-256 digest per artifact (see
 [docs/provenance.md](docs/provenance.md)). Verification is mandatory — a
 mismatch fails the release:
 
@@ -65,8 +97,6 @@ mismatch fails the release:
 script/provenance.sh build   # wasm build + generate + verify (the release gate)
 script/provenance.sh verify  # re-check the current build
 ```
-
----
 
 ## Design
 
@@ -100,8 +130,6 @@ later would be worthless as a guarantee.
 
 For the same reason there is no admin key, no upgrade path, no fee switch and no
 global pause. Immutability is what lets another protocol depend on this one.
-
----
 
 ## The accrual model
 
@@ -137,8 +165,7 @@ with no dust term. That falls out of computing `vested` from the cumulative
 formula rather than by summing per-interval deltas — truncation error is
 re-derived from scratch on every call instead of accumulating. The obvious
 per-interval implementation, which the existing MVPs use, loses a stroop per
-withdrawal and strands it in the pool forever. Verified by property test over
-random schedules and withdrawal patterns.
+withdrawal and strands it in the pool forever.
 
 ### Pause
 
@@ -147,8 +174,6 @@ duration. Total value delivered stays constant; the schedule stretches. The
 recipient can still withdraw while paused — pausing stops *accrual*, not access.
 Freezing earned funds would make pausable streams unacceptable to any serious
 recipient.
-
-A stream paused across its cliff does not silently pass the cliff while frozen.
 
 ### Cancel
 
@@ -160,8 +185,6 @@ stream clock. Every later `vested` call clamps to the reduced deposit, so
 
 Cancelling before the cliff refunds everything — pre-cliff the recipient's
 entitlement is zero by definition.
-
----
 
 ## Decisions
 
@@ -222,9 +245,6 @@ per-stream event cost depends on the *token's* event payload — a token heavier
 than the Stellar Asset Contract used in tests would inflate it, and a cap that
 merely fits today would fail on somebody else's token.
 
-Oversized batches are rejected with `BatchTooLarge` rather than failing opaquely
-at the network level. The SDK chunks client-side.
-
 ### 3. Minimum deposit: `deposited >= duration`
 
 At least one stroop per second. Below that the rate truncates to zero and the
@@ -236,14 +256,12 @@ year-long USDC stream needs only ~3.16 USDC to clear it.
 
 A `transferable: bool` flag alongside `cancellable` and `pausable`. A
 compliance-bound sender — payroll, a KYC'd grant program — can pin the payee at
-creation. Without it those senders simply could not use Fluxora.
+creation. Without it those senders simply could not use Perpetua.
 
 Transfer moves the stream's entire remaining claim. Funds already withdrawn
 stay with the old recipient; accrued but unwithdrawn funds and all future
 accrual belong to the new recipient. The transfer itself changes no schedule or
 accounting value, and only the new recipient may withdraw afterward.
-
----
 
 ## TTL, rent and archival
 
@@ -260,8 +278,7 @@ Three mechanisms:
 1. **Extend on every touch.** Every mutating call bumps that entry's TTL, so an
    actively-used stream never expires.
 2. **Extend generously at creation**, targeting the stream's remaining lifetime
-   plus a 30-day buffer, clamped to the network's `max_entry_ttl`. The clamp is
-   not optional — a multi-year stream *will* need periodic extension regardless.
+   plus a 30-day buffer, clamped to the network's `max_entry_ttl`.
 3. **Permissionless `extend_stream_ttl` and `batch_extend_ttl`.** Anyone can pay
    to keep any stream alive. Unauthenticated on purpose: a recipient's claim must
    never depend on the sender's continued goodwill. There is nothing to grief —
@@ -286,24 +303,11 @@ rather than dropping to it. State only changes what "remaining life" means:
 |---|---|---|
 | `Active` | remaining effective life (schedule plus any accumulated pauses) + buffer | funded to its end plus the keeper's working window |
 | `Paused` | stretched end (schedule + accumulated and in-progress pauses) + buffer | a paused stream is not settled; its end slides forward in wall-clock terms |
-| `Cancelled` | the floor | cancel collapses the schedule onto "now", so remaining life is zero (a cancel before `start_time` still funds up to the unopened start); the floor keeps the vested tail withdrawable and the final state indexable |
+| `Cancelled` | the floor | cancel collapses the schedule onto "now", so remaining life is zero; the floor keeps the vested tail withdrawable and the final state indexable |
 | `Depleted` | the floor | fully paid out is not the same as forgotten; the terminal record stays readable |
 
 The instance entry (the id counter) is always extended to the network maximum,
 whatever the streams are doing.
-
-Expired and missing records: on a live network a transaction touching an
-archived entry fails **before** the contract executes and must be resubmitted
-with a `RestoreFootprint` (see the caveat below). The contract itself answers
-an id it cannot see with `Error::StreamNotFound` (#1), and a call that fails
-this way mutates nothing — both halves of that contract-side story are pinned
-by deterministic assertions in `test::ttl`. Batch calls differ by design:
-`batch_withdraw` fails the whole batch with `StreamNotFound`, while
-`batch_extend_ttl` skips unknown ids so a keeper's sweep survives a stale
-index. `stream_exists(id) == false` while `id < stream_count()` is the
-integrator's signal for "archived, not nonexistent"; whether that signal holds
-against a real RPC is exactly the stage-4 territory
-[KNOWN-LIMITATIONS.md §1](KNOWN-LIMITATIONS.md) tracks.
 
 ### What the tests prove, and what they do not
 
@@ -324,8 +328,6 @@ costs.
 **TTL is therefore half-proven.** Closing the other half against live testnet is
 the acceptance criterion for stage 4, not a nice-to-have. Full detail and
 integrator guidance in [docs/KNOWN-LIMITATIONS.md §1](docs/KNOWN-LIMITATIONS.md).
-
----
 
 ## Function surface
 
@@ -370,20 +372,26 @@ on, plus enough state to reconstruct the stream without replaying from genesis.
 Field order and topic placement are ABI: adding a field is compatible,
 reordering one is not.
 
----
-
 ## Repository layout
 
 ```
-contracts/stream/
-  src/
-    lib.rs              contract entry points
-    accrual.rs          pure vesting math, no Env
-    storage.rs          storage access and TTL policy
-    events.rs           event definitions
-    types.rs            Stream, StreamStatus, DataKey
-    error.rs            typed errors (discriminants are ABI)
-    test/               140 tests, staged by build order
+contracts/                        the deployable contracts (standalone Cargo projects)
+  stream/                         the product: streaming primitive
+    src/lib.rs                    contract entry points
+    src/accrual.rs                pure vesting math, no Env
+    src/storage.rs                storage access and TTL policy
+    src/events.rs                 event definitions
+    src/types.rs                  Stream, StreamStatus, DataKey
+    src/error.rs                  typed errors (discriminants are ABI)
+    src/test/                     36 modules, ~570 tests, staged by build order
+  factory/                        policy gate (cap, duration, rate bounds, allowlist, pause)
+  governance/                     timelocked multi-sig for factory policy
+  archival-probe/                 throwaway archival/restore probe — never deploy
+
+script/                           release, provenance, sandbox, validation automation
+tools/provenance/                 release-integrity gate: SLSA-style wasm manifests
+tests/                            validator test suite (pytest)
+docs/                             ABI, limitations, migration and design documents
 ```
 
 `accrual.rs` takes a `Stream` and a timestamp and returns a number — no `Env`, no
@@ -400,19 +408,18 @@ and [`script/archival-canary.sh`](script/archival-canary.sh)). It writes a
 persistent entry and deliberately never extends its TTL, so it archives on the
 network's minimum schedule.
 
-It remains a **workspace member** — so `cargo test --workspace`, `cargo fmt --all`
-and `cargo clippy --all-targets` keep covering its smoke test — but it is
-**explicitly excluded from release artifacts**: `script/release.sh` builds only the
-`fluxora-stream` package and rejects a probe wasm among its outputs. To build the
-probe on its own, use the explicit command:
+It is a **standalone Cargo project** — it builds and tests on its own, and
+because it never shares an output directory with the product its wasm cannot be
+swept into a release. `script/release.sh` builds only the `fluxora-stream`
+package and rejects any unexpected wasm in the product's output. To work with
+the probe explicitly:
 
 ```bash
-cargo build -p fluxora-archival-probe --target wasm32v1-none --release
+cd contracts/archival-probe && cargo test
+cd contracts/archival-probe && cargo build --target wasm32v1-none --release
 ```
 
 This is the documented design decision for issue #1543.
-
----
 
 ## Non-goals for v1
 
@@ -420,26 +427,25 @@ No admin key, no upgradeability, no global pause. No fee mechanism. No on-chain
 stream discovery. No multi-token streams. No unlock curves other than cliff plus
 linear. No cross-chain anything.
 
----
-
 ## Status
 
 Stages 1–3 complete: contract core, full lifecycle, TTL and resource limits.
+The repository is now a two-part project: the contract crates are standalone
+and independently buildable/testable, and the tooling (release, provenance,
+validation) operates on them through committed paths only.
 
 **Stage 4 (in progress).** Deployed to testnet as
 [`CBCGTSCJ…THXW`](https://stellar.expert/explorer/testnet/contract/CBCGTSCJXBMPPPE4BPDIPYZXPE2J5TQEKD2KCS7VQF533NKKEYGUTHXW);
-`script/testnet-exercise.sh` calls every entrypoint against the live deployment
-and passes 35/35 assertions.
+`script/testnet-exercise.sh` calls every entrypoint against the live deployment.
 
 Its acceptance criterion — the live archival restore round trip — is **not yet
-met**. A canary entry was planted on 2026-08-12 and archives ~2026-08-19; see
+met**. A canary entry was planted on 2026-08-12; see
 [docs/KNOWN-LIMITATIONS.md §1](docs/KNOWN-LIMITATIONS.md) and
 `script/archival-canary.sh`.
 
 Then the indexer, keeper and TypeScript SDK (stage 5), reference UI last (stage 6).
 
-Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.md) — the
-frontend's four contract calls all break, the backend is unaffected.
+Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
 ## Documents
 
@@ -455,4 +461,3 @@ frontend's four contract calls all break, the backend is unaffected.
 > **Note for deployment:** the `stellar` CLI must be at least version 27 to match
 > the protocol. A protocol-23 CLI will scaffold and may misreport against a
 > protocol-27 network.
-

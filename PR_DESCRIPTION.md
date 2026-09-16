@@ -62,7 +62,7 @@ That ensures the sender receives exactly the unvested remainder, the recipient h
 I verified this with the required focused suite:
 
 ```bash
-source $HOME/.cargo/env && cd /workspaces/Fluxora-Contracts && cargo test -p fluxora-stream cancel -- --nocapture
+source $HOME/.cargo/env && cd /workspaces/Perpetua-Contracts && cargo test -p fluxora-stream cancel -- --nocapture
 ```
 
 Evidence from the fresh run:

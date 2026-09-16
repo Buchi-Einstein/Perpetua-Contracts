@@ -145,14 +145,23 @@ jobs:
             ${{ runner.os }}-cargo-lint-
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          for dir in contracts/*/; do
+            echo "=== fmt: $(basename "$dir") ==="
+            (cd "$dir" && cargo fmt --all -- --check)
+          done
 
       # Lints are hard failures. A warning that CI tolerates is a warning
       # nobody ever fixes.
-      - name: Clippy (entire workspace and test targets)
-        # Keep the scope explicit: every workspace member and test target is
-        # linted, so a new modular contract cannot bypass the quality gate.
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (all contracts and test targets)
+        # Keep the scope explicit: every standalone contract project (and its
+        # test targets) is linted, so a new modular contract cannot bypass the
+        # quality gate.
+        run: |
+          for dir in contracts/*/; do
+            echo "=== clippy: $(basename "$dir") ==="
+            (cd "$dir" && cargo clippy --all-targets --all-features -- -D warnings)
+          done
 
       # Issue #1594 — reject accidental renames of the deployable package and
       # WASM artifact before any build work happens.  This is an independent
@@ -167,6 +176,8 @@ jobs:
       - name: Check package and artifact names
         run: |
           echo "=== cargo metadata package/target check ==="
+          # Each contract is standalone; the stream contract is the product.
+          cd contracts/stream
           meta=$(cargo metadata --format-version 1 --no-deps)
 
           # ---- package name ----
@@ -180,7 +191,7 @@ jobs:
           if echo "$pkg_name" | grep -qw "fluxora-stream"; then
             echo "  package name 'fluxora-stream' ✓"
           else
-            echo "::error::Package 'fluxora-stream' not found in workspace. Found: $pkg_name"
+            echo "::error::Package 'fluxora-stream' not found in the stream contract project. Found: $pkg_name"
             echo "::error::If this rename is intentional, update the canonical values in"
             echo "::error::  .github/workflows/ci.yml (this step)"
             echo "::error::  contracts/stream/src/test/packaging.rs (EXPECTED_PACKAGE_NAME)"
@@ -214,17 +225,31 @@ jobs:
             exit 1
           fi
 
-      - name: Build workspace
-        run: cargo build --workspace
+      - name: Build all contracts
+        run: |
+          for dir in contracts/*/; do
+            echo "=== build: $(basename "$dir") ==="
+            (cd "$dir" && cargo build)
+          done
 
       # Issue #1516: run tests and surface pass/fail/ignored counts so a
       # green run that skipped 140 tests cannot look identical to one that
       # actually ran them.  The output is tee'd to a temp file so the
       # reporting step can always run (even on failure) without re-executing.
-      - name: Tests (workspace)
+      - name: Tests (all contracts)
         run: |
-          cargo test --workspace --all-features 2>&1 | tee /tmp/ci-test-output.txt
-          echo "test_exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          : > /tmp/ci-test-output.txt
+          overall=0
+          for dir in contracts/*/; do
+            echo "=== test: $(basename "$dir") ==="
+            if (cd "$dir" && cargo test --all-features) 2>&1 | tee -a /tmp/ci-test-output.txt; then
+              :
+            else
+              overall=1
+            fi
+          done
+          echo "test_exit=$overall" >> "$GITHUB_OUTPUT"
+          exit $overall
         id: tests
 
       # ── Ignored-test visibility ────────────────────────────────────────────
@@ -265,15 +290,16 @@ jobs:
       # protocol-version change that moves costs is visible in the CI log
       # before it becomes a production surprise.
       - name: Resource report
-        run: cargo test --release resource_limits -- --nocapture --test-threads=1
+        run: (cd contracts/stream && cargo test --release resource_limits -- --nocapture --test-threads=1)
 
       # Build release artifacts via the release command, not a bare workspace
       # build. This is deliberate isolation (issue #1543): the archival probe
-      # shares the workspace but must never ship. `script/release.sh` builds only
-      # the `fluxora-stream` product package and fails if a probe wasm would be
-      # produced, so this step is also the regression test for "a release produces
-      # only product artifacts". The probe's smoke test still runs above via
-      # `cargo test --all-features`.
+      # (and the factory/governance contracts) live outside the product release
+      # path, and `script/release.sh` builds only the `fluxora-stream` product
+      # package inside contracts/stream — it fails if any unexpected wasm would
+      # be produced, so this step is also the regression test for "a release
+      # produces only product artifacts". Every contract's own test suite still
+      # runs above via the per-contract `cargo test --all-features` loop.
       - name: Build release artifacts (product only)
         run: script/release.sh
 
@@ -292,28 +318,34 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-build-
 
-      # Hard gate: Cargo.lock must be committed and unchanged (the "Dependency
-      # resolution" residual risk documented in contracts/stream/src/checksum.rs's
+      # Hard gate: each contract's Cargo.lock must be committed and unchanged (the
+      # "Dependency resolution" residual risk documented in contracts/stream/src/checksum.rs's
       # build-reproducibility contract). `cargo update --locked` fails immediately
       # if resolving the current Cargo.toml manifests would produce a different
       # Cargo.lock, catching an unpinned `^` dependency silently drifting.
       - name: Verify Cargo.lock is committed and unchanged
         run: |
           set -euo pipefail
-          if ! cargo update --locked --workspace; then
-            echo "::error::Cargo.lock would change on dependency resolution — it is out of sync with the committed Cargo.toml manifests."
-            echo "::error::This breaks the WASM build-reproducibility contract documented in contracts/stream/src/checksum.rs ('Dependency resolution: Cargo.lock must be committed and unchanged')."
-            echo "::error::If this dependency change is intentional, run 'cargo update' locally, review the diff, and commit the updated Cargo.lock alongside your change."
-            exit 1
-          fi
+          for dir in contracts/*/; do
+            echo "=== lockfile: $(basename "$dir") ==="
+            (cd "$dir" && cargo update --locked)
+          done
           echo "provenance:"
-          cat target/wasm32v1-none/release/provenance.json
+          cat contracts/stream/target/wasm32v1-none/release/provenance.json
 
       - name: Build release (native)
-        run: cargo build --release --workspace
+        run: |
+          for dir in contracts/*/; do
+            echo "=== release(native): $(basename "$dir") ==="
+            (cd "$dir" && cargo build --release)
+          done
 
       - name: Build WASM (all contracts)
-        run: cargo build --release --workspace --target wasm32v1-none
+        run: |
+          for dir in contracts/*/; do
+            echo "=== release(wasm): $(basename "$dir") ==="
+            (cd "$dir" && cargo build --release --target wasm32v1-none)
+          done
 
       - name: Install Stellar CLI (pinned)
         run: |
@@ -330,14 +362,16 @@ jobs:
 
       - name: Optimize WASM
         run: |
-          stellar contract optimize --wasm target/wasm32v1-none/release/fluxora_stream.wasm
+          stellar contract optimize --wasm contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm
 
       - name: Compute WASM SHA256 hash
         run: |
-          sha256sum target/wasm32v1-none/release/fluxora_stream.wasm > target/wasm32v1-none/release/fluxora_stream.wasm.sha256
-          if [ -f target/wasm32v1-none/release/fluxora_stream.optimized.wasm ]; then
-            sha256sum target/wasm32v1-none/release/fluxora_stream.optimized.wasm > target/wasm32v1-none/release/fluxora_stream.optimized.wasm.sha256
+          cd contracts/stream/target/wasm32v1-none/release && {
+          sha256sum fluxora_stream.wasm > fluxora_stream.wasm.sha256
+          if [ -f fluxora_stream.optimized.wasm ]; then
+            sha256sum fluxora_stream.optimized.wasm > fluxora_stream.optimized.wasm.sha256
           fi
+          }
 
       - name: Verify WASM build reproducibility
         if: ${{ hashFiles('script/verify-wasm-checksum.sh') != '' }}
@@ -347,11 +381,13 @@ jobs:
         run: |
           echo "## WASM Contracts Built" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          for wasm in target/wasm32v1-none/release/*.wasm; do
-            if [ -f "$wasm" ]; then
-              SIZE=$(stat --printf='%s' "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null || echo "unknown")
-              echo "- $(basename $wasm) — ${SIZE} bytes" >> "$GITHUB_STEP_SUMMARY"
-            fi
+          for dir in contracts/*/; do
+            for wasm in "$dir"/target/wasm32v1-none/release/*.wasm; do
+              if [ -f "$wasm" ]; then
+                SIZE=$(stat --printf='%s' "$wasm" 2>/dev/null || stat -f%z "$wasm" 2>/dev/null || echo "unknown")
+                echo "- $(basename $wasm) — ${SIZE} bytes" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            done
           done
 
       - name: Upload WASM hash artifact
@@ -359,8 +395,8 @@ jobs:
         with:
           name: fluxora_stream-wasm-hash
           path: |
-            target/wasm32v1-none/release/fluxora_stream.wasm.sha256
-            target/wasm32v1-none/release/fluxora_stream.optimized.wasm.sha256
+            contracts/stream/target/wasm32v1-none/release/fluxora_stream.wasm.sha256
+            contracts/stream/target/wasm32v1-none/release/fluxora_stream.optimized.wasm.sha256
           retention-days: 30
           if-no-files-found: warn
 
@@ -381,6 +417,7 @@ jobs:
       - name: Check package and artifact names (metadata)
         run: |
           echo "=== cargo metadata package/target check ==="
+          cd contracts/stream
           meta=$(cargo metadata --format-version 1 --no-deps)
 
           pkg_name=$(echo "$meta" | python3 -c "
@@ -423,7 +460,7 @@ jobs:
       # Rust-level gate: runs the focused packaging:: test module.
       # --nocapture surfaces the confirmation lines for each invariant.
       - name: Check package and artifact names (test suite)
-        run: "cargo test --all-features packaging:: -- --nocapture --test-threads=1"
+        run: cd contracts/stream && cargo test --all-features packaging:: -- --nocapture --test-threads=1
 
   fuzz-feature-matrix:
     name: feature matrix check
@@ -442,7 +479,7 @@ jobs:
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Check fluxora-stream with ${{ matrix.features }}
-        run: cargo check -p fluxora-stream ${{ matrix.features }}
+        run: cd contracts/stream && cargo check ${{ matrix.features }}
 
   fuzz:
     name: randomized and property suites
@@ -478,10 +515,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 
-      # Regenerate Cargo.lock to match current workspace deps (the committed
-      # lock file may lag behind Cargo.toml changes).
+      # Regenerate Cargo.lock to match current manifests (each contract is standalone;
+      # the committed lock files may lag behind Cargo.toml changes).
       - name: Sync Cargo.lock
-        run: cargo update --workspace
+        run: |
+          for dir in contracts/*/; do
+            echo "=== sync lockfile: $(basename "$dir") ==="
+            (cd "$dir" && cargo update)
+          done
 
       # Hard gate (#1014): the `rand_core` version skew that used to break this
       # step (rand_core 0.6 via ed25519-dalek vs. rand_core 0.9 via a testutils
@@ -490,7 +531,7 @@ jobs:
       # `test = false` in contracts/stream/Cargo.toml, so `--features testutils`
       # builds and runs cleanly. Snapshot and gas regressions must fail the build.
       - name: Run tests with snapshot validation
-        run: cargo test -p fluxora_stream --features testutils -- --nocapture
+        run: cd contracts/stream && cargo test --features testutils -- --nocapture
         env:
           # Ensure snapshots are validated, not updated
           SOROBAN_SNAPSHOT_UPDATE: ""
@@ -517,9 +558,9 @@ jobs:
         run: python3 script/validate_gas.py
 
       # NOTE: --features cannot be combined with --workspace in Cargo 1.80+;
-      # use -p to target the specific package.
+      # each contract is standalone, so the package is selected by directory.
       - name: Run tests (stream — all features)
-        run: cargo test -p fluxora-stream --features testutils
+        run: cd contracts/stream && cargo test --features testutils
         continue-on-error: true
 
       # Hard gate: factory discriminant-stability test is testutils-free and
@@ -527,7 +568,7 @@ jobs:
       # silent discriminant drift. See contracts/factory/tests/factory_error_discriminants.rs.
       - name: Factory discriminant-stability tests
         if: ${{ hashFiles('contracts/factory/Cargo.toml') != '' }}
-        run: cargo test -p fluxora_factory
+        run: cd contracts/factory && cargo test
 
       # Hard gate: cross-file collision audit. Parses all three discriminant
       # tables in docs/error.md and fails (exit 1) on any intra-section
@@ -666,15 +707,15 @@ jobs:
           # Default tarpaulin per-test timeout is 60s. Instrumented proptest
           # suites in test_withdrawable_props exceed that and abort the job with
           # "Timed out waiting for test response" (seen on PR coverage runs).
+          cd contracts/stream
           cargo tarpaulin \
             --features testutils \
             --out Xml \
             --out Html \
-            --output-dir coverage \
+            --output-dir ../../coverage \
             --ignore-tests \
             --skip-clean \
-            --timeout 300 \
-            -p fluxora_stream
+            --timeout 300
 
       - name: Enforce 95% coverage gate
         run: |

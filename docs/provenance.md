@@ -65,8 +65,8 @@ told, defaulting to `wasm32v1-none`, and `verify` fails if the recorded target
 does not match. The PR that implements this therefore verifies with:
 
 ```bash
-cargo build --workspace --target wasm32v1-none --release
-sha256sum -c target/wasm32v1-none/release/SHASUMS
+cargo build --target wasm32v1-none --release      # from contracts/stream (or script/release.sh)
+sha256sum -c contracts/stream/target/wasm32v1-none/release/SHASUMS
 ```
 
 ---
@@ -90,7 +90,7 @@ write). Example:
     }
   ],
   "build": {
-    "build_type": "https://github.com/Fluxora-Org/Fluxora-Contracts/provenance/v1",
+    "build_type": "https://github.com/hannyloveworld/Perpetua-Contracts/provenance/v1",
     "target": "wasm32v1-none",
     "profile": {
       "codegen-units": 1,

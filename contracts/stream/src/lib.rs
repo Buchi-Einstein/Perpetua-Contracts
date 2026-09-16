@@ -1,5 +1,5 @@
 #![no_std]
-//! # Fluxora — continuous payment streaming for Soroban
+//! # Perpetua — continuous payment streaming for Soroban
 //!
 //! Lock tokens once; have them accrue continuously to a recipient over time.
 //! The recipient pulls their accrued balance whenever they like.
@@ -45,12 +45,12 @@
 
 #[cfg(all(target_family = "wasm", not(target_os = "none")))]
 compile_error!(
-    "Fluxora production WASM must be built for wasm32v1-none; wasm32-unknown-unknown can emit unsupported features."
+    "Perpetua production WASM must be built for wasm32v1-none; wasm32-unknown-unknown can emit unsupported features."
 );
 #[cfg(all(target_family = "wasm", debug_assertions))]
-compile_error!("Fluxora production WASM must be built without debug assertions; use --release.");
+compile_error!("Perpetua production WASM must be built without debug assertions; use --release.");
 #[cfg(all(target_family = "wasm", feature = "testutils"))]
-compile_error!("Fluxora production WASM must not enable the testutils feature.");
+compile_error!("Perpetua production WASM must not enable the testutils feature.");
 
 // The test suite runs against the host with `std` available; the contract
 // itself is strictly `no_std`.
@@ -129,7 +129,7 @@ pub const ABI_VERSION: u32 = 1;
 /// comes from the stream contract or from the token contract without out-of-band
 /// knowledge of which contract threw. Forwarding the raw token discriminant
 /// would cause silent misinterpretation — e.g. token error #7 would decode as
-/// `Unauthorized` against Fluxora's table, which is wrong and unsettling.
+/// `Unauthorized` against Perpetua's table, which is wrong and unsettling.
 ///
 /// Instead, failures are bucketed into two stream-level categories that are
 /// stable, unambiguous, and actionable:

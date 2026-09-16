@@ -1,6 +1,6 @@
 # Pin your Soroban reads to a single ledger
 
-*A note from the Fluxora team. Written against Stellar testnet, protocol 27,
+*A note from the Perpetua team. Written against Stellar testnet, protocol 27,
 `stellar-cli` 27.1.0, on 2026-08-12.*
 
 ## The pattern
@@ -28,7 +28,7 @@ load-balanced read endpoint, and it costs almost nothing to adopt.
 
 ## What prompted us to look
 
-Fluxora is a payment-streaming contract. Value accrues continuously, so we have
+Perpetua is a payment-streaming contract. Value accrues continuously, so we have
 a conservation invariant:
 
 ```
@@ -129,7 +129,7 @@ If a client needs vested, withdrawable and refundable together, give it a view
 that returns the whole struct and let it compute the three locally. One call is
 one ledger, by construction; there is nothing to pin.
 
-Fluxora's `get_stream` does this, which is why the fix for our own script was
+Perpetua's `get_stream` does this, which is why the fix for our own script was
 partly "stop calling `vested_of` and `refundable_of` separately".
 
 ### 2. Put a barrier after every write
@@ -205,7 +205,7 @@ wrong thing.
 
 ---
 
-*Written while building [Fluxora](https://github.com/Fluxora-Org/Fluxora-Contracts),
+*Written while building [Perpetua](https://github.com/hannyloveworld/Perpetua-Contracts),
 a continuous payment streaming primitive for Soroban. The pattern is the point;
 the observation is one data point. Corrections and contradicting data are both
 welcome, and we will amend this note.*

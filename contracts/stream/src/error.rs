@@ -1,6 +1,6 @@
 use soroban_sdk::contracterror;
 
-/// Every failure mode in Fluxora is a typed error. Nothing panics on a numeric
+/// Every failure mode in Perpetua is a typed error. Nothing panics on a numeric
 /// edge case: all arithmetic is checked and maps to [`Error::Overflow`].
 ///
 /// Zero-amount policy: zero or negative deposit, top-up, and explicit
@@ -108,7 +108,7 @@ pub enum Error {
     ///
     /// The token contract's internal error discriminant is **intentionally
     /// discarded** here. Forwarding it would produce a value that clients
-    /// decode against Fluxora's own error table, yielding a silent
+    /// decode against Perpetua's own error table, yielding a silent
     /// misinterpretation. The raw diagnostic is visible on chain in the failed
     /// transaction's `diagnosticEvents`; this variant is what a stream client
     /// should match on.

@@ -2,7 +2,7 @@
 //! # Archival probe — **not part of the product**
 //!
 //! This contract exists for exactly one reason: to prove, against a real
-//! network, the one thing Fluxora's unit tests structurally cannot.
+//! network, the one thing Perpetua's unit tests structurally cannot.
 //!
 //! ## What it is for
 //!
@@ -21,12 +21,12 @@
 //!
 //! ## Why a separate contract
 //!
-//! Fluxora floors every stream entry's TTL at 30 days, and the network floors
+//! Perpetua floors every stream entry's TTL at 30 days, and the network floors
 //! *any* persistent entry at `min_persistent_ttl` — 120,960 ledgers, about 7
-//! days, on both testnet and local quickstart. A real Fluxora stream therefore
+//! days, on both testnet and local quickstart. A real Perpetua stream therefore
 //! cannot archive for a month.
 //!
-//! This probe deliberately does the one thing Fluxora never does: it writes a
+//! This probe deliberately does the one thing Perpetua never does: it writes a
 //! persistent entry and **never extends its TTL**. The entry then lives exactly
 //! `min_persistent_ttl` and archives as early as the network permits. The
 //! restore mechanism it exercises is identical for any persistent entry — it is

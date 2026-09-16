@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Stage 4 — exercise every Fluxora entrypoint against live testnet.
+# Stage 4 — exercise every Perpetua entrypoint against live testnet.
 #
 # This is the credibility artifact: it proves the deployed contract behaves on a
 # real network the way the unit suite says it does. Every public function is
@@ -144,7 +144,7 @@ check_true() {
 
 cat <<BANNER
 ╭──────────────────────────────────────────────────────────────────────╮
-│ Fluxora — testnet exercise                                           │
+│ Perpetua — testnet exercise                                           │
 ╰──────────────────────────────────────────────────────────────────────╯
  network   $NETWORK
  contract  $CONTRACT

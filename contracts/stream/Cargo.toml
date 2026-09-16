@@ -1,10 +1,26 @@
+# Perpetua stream contract — standalone Cargo project.
+#
+# This crate no longer belongs to a shared workspace: it is its own project
+# with its own lockfile, so it can be built and released on its own.
+#
+#   cargo build  --target wasm32v1-none --release   # -> fluxora_stream.wasm
+#   cargo test                                      # full suite (host target)
+#
+# soroban-sdk's major version tracks the Stellar protocol version; do not
+# upgrade past the protocol the target network actually runs. Protocol 27 is
+# live on both testnet and mainnet as of 2026-08.
+
+[workspace]
+resolver = "2"
+members = ["."]
+
 [package]
 name = "fluxora-stream"
 description = "Continuous payment streaming primitive for Soroban"
-version = { workspace = true }
-edition = { workspace = true }
-license = { workspace = true }
-repository = { workspace = true }
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hannyloveworld/Perpetua-Contracts"
 publish = false
 
 [lib]
@@ -15,9 +31,25 @@ doctest = false
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = { workspace = true }
+soroban-sdk = "27.0.5"
 
 [dev-dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+soroban-sdk = { version = "27.0.5", features = ["testutils"] }
 proptest = "1"
-serde_json = { workspace = true }
+# Used by the packaging tests to parse `cargo metadata` JSON output.
+# Only a dev-dependency; never compiled into the contract WASM.
+serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.release-with-logs]
+inherits = "release"
+debug-assertions = true

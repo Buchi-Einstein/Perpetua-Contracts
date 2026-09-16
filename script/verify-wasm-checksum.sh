@@ -5,7 +5,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WASM_DIR="$REPO_ROOT/target/wasm32-unknown-unknown/release"
+STREAM_DIR="$REPO_ROOT/contracts/stream"
+WASM_DIR="$STREAM_DIR/target/wasm32-unknown-unknown/release"
 SHA256_FILE="$WASM_DIR/fluxora_stream.wasm.sha256"
 OPT_SHA256_FILE="$WASM_DIR/fluxora_stream.optimized.wasm.sha256"
 
@@ -16,15 +17,15 @@ fi
 
 if [[ "$NO_BUILD" == "false" ]]; then
     echo "Building WASM..."
-    cd "$REPO_ROOT"
-    cargo build --release -p fluxora_stream --target wasm32-unknown-unknown
+    cd "$STREAM_DIR"
+    cargo build --release --target wasm32-unknown-unknown
 fi
 
 echo "Verifying WASM SHA256 checksums..."
 
 if [[ ! -f "$SHA256_FILE" ]]; then
     echo "ERROR: WASM checksum file not found at $SHA256_FILE"
-    echo "Run 'sha256sum target/wasm32-unknown-unknown/release/fluxora_stream.wasm > ...sha256' first."
+    echo "Run 'sha256sum contracts/stream/target/wasm32-unknown-unknown/release/fluxora_stream.wasm > ...sha256' first."
     exit 1
 fi
 

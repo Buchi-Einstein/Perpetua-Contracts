@@ -1,4 +1,4 @@
-//! Provenance generation and verification for Fluxora contract wasm artifacts.
+//! Provenance generation and verification for Perpetua contract wasm artifacts.
 //!
 //! Every deployable wasm the workspace produces gets a machine-readable
 //! manifest tying its bytes to the exact inputs of the build — git revision,
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const SCHEMA: &str = "https://slsa.dev/provenance/v1.0";
-pub const BUILD_TYPE: &str = "https://github.com/Fluxora-Org/Fluxora-Contracts/provenance/v1";
+pub const BUILD_TYPE: &str = "https://github.com/hannyloveworld/Perpetua-Contracts/provenance/v1";
 pub const DEFAULT_TARGET: &str = "wasm32v1-none";
 pub const MANIFEST_FILENAME: &str = "provenance.json";
 pub const SHASUMS_FILENAME: &str = "SHASUMS";

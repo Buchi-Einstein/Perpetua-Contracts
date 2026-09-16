@@ -1,19 +1,19 @@
-# Standalone build tool — deliberately NOT a workspace member.
+# Standalone build tool — deliberately its own Cargo project.
 #
-# The workspace's product crates build for wasm32v1-none (a no_std target);
-# this tool needs std and the host target, so it lives outside the workspace
-# to keep `cargo build --workspace --target wasm32v1-none --release` working
-# unchanged. CI builds and tests it explicitly via script/provenance.sh.
+# The contract crates are each standalone projects built for wasm32v1-none (a
+# no_std target); this tool needs std and the host target, so it lives outside
+# contracts/ and keeps `cargo build` working unchanged. CI builds and tests it
+# explicitly via script/provenance.sh.
 [package]
 name = "fluxora-provenance"
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Generate and verify wasm provenance manifests for Fluxora contract releases"
+description = "Generate and verify wasm provenance manifests for Perpetua contract releases"
 publish = false
 
-# Opt out of the parent workspace (the workspace root's Cargo.toml declares
-# [workspace]): the tool builds for the host, never for wasm32v1-none.
+# Opt out of any surrounding workspace: this tool builds for the host, never
+# for wasm32v1-none.
 [workspace]
 
 [dependencies]

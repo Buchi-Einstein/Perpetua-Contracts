@@ -1,7 +1,7 @@
 # Known limitations
 
 What a green test suite here does **not** prove. Read this before treating any
-part of Fluxora as production-ready.
+part of Perpetua as production-ready.
 
 ---
 
@@ -80,10 +80,10 @@ Genuine archival cannot be observed quickly on *any* network. Measured
 |---|---|---|
 | `min_persistent_ttl` | 120,960 | **7 days** |
 | `max_entry_ttl` | 3,110,400 | 180 days |
-| Fluxora's own floor (`MIN_STREAM_TTL_LEDGERS`) | 518,400 | 30 days |
+| Perpetua's own floor (`MIN_STREAM_TTL_LEDGERS`) | 518,400 | 30 days |
 
 The 7-day figure is a *network* floor applied at entry creation — no contract
-can undercut it. Fluxora's 30-day floor sits on top, so a real stream entry
+can undercut it. Perpetua's 30-day floor sits on top, so a real stream entry
 cannot archive for a month. That floor is deliberate and stays: a settled stream
 must remain readable for the recipient's unclaimed tail and the indexer's final
 state.
@@ -125,14 +125,14 @@ reshaped to fit whatever happens.
 **Outcome A — the entry archives and the restore round trip works.**
 This section closes. The claim we then make, and its exact limits:
 
-> Fluxora's archival recovery path is verified end to end against live Stellar
+> Perpetua's archival recovery path is verified end to end against live Stellar
 > testnet: an entry was allowed to archive, the subsequent read failed at the
 > network level, a `RestoreFootprint` operation recovered it, and the stored
 > value came back intact.
 
 That is a headline claim and it is a real differentiator — no other Soroban
 streaming implementation has demonstrated it. It still does **not** claim that a
-Fluxora *stream* archived: the probe is a separate contract, and the argument
+Perpetua *stream* archived: the probe is a separate contract, and the argument
 that the result transfers is that restore is a property of the ledger entry, not
 of the contract that wrote it. State that reasoning whenever the claim is made
 rather than letting the audience assume a stream was involved.
@@ -182,7 +182,7 @@ testnet simulation and reconcile.
 ## 3. `MAX_BATCH_SIZE` is calibrated against one token
 
 The cap is bounded by the **contract event budget**, and roughly half of the
-per-stream event cost is the *token's* `transfer` event, not Fluxora's
+per-stream event cost is the *token's* `transfer` event, not Perpetua's
 `withdrawn` event. Measured against the Stellar Asset Contract. A SEP-41 token
 with a heavier event payload shifts the ceiling down.
 
