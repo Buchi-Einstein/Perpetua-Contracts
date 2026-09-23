@@ -98,6 +98,17 @@ script/provenance.sh build   # wasm build + generate + verify (the release gate)
 script/provenance.sh verify  # re-check the current build
 ```
 
+### WASM checksum verification
+
+To verify that a locally built WASM matches the official released binary bytes:
+
+```bash
+script/verify-wasm-checksum.sh        # builds and verifies
+script/verify-wasm-checksum.sh --no-build  # verifies existing build
+```
+
+Output shows green status for success, red for failure.
+
 ## Design
 
 ### Pull-based, because Stellar has no scheduler
