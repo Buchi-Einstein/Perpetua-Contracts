@@ -61,6 +61,8 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
+    /// Signer configuration generation captured when the proposal was created.
+    pub signer_generation: u64,
     /// True once `execute` has been called successfully.
     pub executed: bool,
     /// True once `cancel_proposal` has been called. Terminal — no further
@@ -113,6 +115,8 @@ pub enum GovernanceError {
     CalldataEmpty = 19,
     /// Proposal calldata failed to decode into a known `CallData` variant.
     InvalidCalldata = 20,
+    /// The signer configuration changed after the proposal was created.
+    InvalidSignerGeneration = 21,
 }
 
 /// Storage keys for the governance contract.
@@ -124,6 +128,8 @@ pub enum DataKey {
     Signers,
     /// Minimum approval threshold (instance storage).
     Threshold,
+    /// Monotonic signer configuration generation (instance storage).
+    SignerGeneration,
     /// Monotonic proposal ID counter (instance storage).
     NextProposalId,
     /// Persistent record for a proposal (persistent storage, keyed by ID).
@@ -480,6 +486,21 @@ fn get_threshold(env: &Env) -> Result<u32, GovernanceError> {
         .ok_or(GovernanceError::NotInitialized)
 }
 
+fn get_signer_generation(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::SignerGeneration)
+        .unwrap_or(0u64)
+}
+
+fn bump_signer_generation(env: &Env) -> Result<u64, GovernanceError> {
+    let next = get_signer_generation(env)
+        .checked_add(1)
+        .ok_or(GovernanceError::ArithmeticOverflow)?;
+    env.storage().instance().set(&DataKey::SignerGeneration, &next);
+    Ok(next)
+}
+
 fn read_next_proposal_id(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -582,6 +603,9 @@ impl FluxoraGovernance {
             .set(&DataKey::Threshold, &threshold);
         env.storage()
             .instance()
+            .set(&DataKey::SignerGeneration, &0u64);
+        env.storage()
+            .instance()
             .set(&DataKey::NextProposalId, &0u32);
 
         bump_instance(&env);
@@ -636,6 +660,7 @@ impl FluxoraGovernance {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &new_threshold);
+        bump_signer_generation(&env)?;
         bump_instance(&env);
 
         env.events().publish(
@@ -675,6 +700,7 @@ impl FluxoraGovernance {
         signer_index.set(signer.clone(), true);
         env.storage().instance().set(&DataKey::Signers, &signers);
         save_signer_index(&env, &signer_index);
+        bump_signer_generation(&env)?;
         bump_instance(&env);
 
         // CEI: the updated signer set is persisted before the event is emitted.
@@ -727,6 +753,7 @@ impl FluxoraGovernance {
         signer_index.remove(signer.clone());
         env.storage().instance().set(&DataKey::Signers, &signers);
         save_signer_index(&env, &signer_index);
+        bump_signer_generation(&env)?;
         bump_instance(&env);
 
         // CEI: the updated signer set is persisted before the event is
@@ -769,6 +796,7 @@ impl FluxoraGovernance {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        bump_signer_generation(&env)?;
         bump_instance(&env);
 
         // CEI: the new threshold is persisted before the event is emitted.
@@ -834,6 +862,7 @@ impl FluxoraGovernance {
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
             created_at: now,
+            signer_generation: get_signer_generation(&env),
             executed: false,
             cancelled: false,
         };
@@ -992,6 +1021,9 @@ impl FluxoraGovernance {
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
         {
             return Err(GovernanceError::ProposalExpired);
+        }
+        if proposal.signer_generation != get_signer_generation(&env) {
+            return Err(GovernanceError::InvalidSignerGeneration);
         }
 
         // Verify quorum was reached and use the recorded threshold (snapshot at
@@ -1215,6 +1247,9 @@ impl FluxoraGovernance {
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
         {
+            return Ok(false);
+        }
+        if proposal.signer_generation != get_signer_generation(&env) {
             return Ok(false);
         }
 
@@ -2071,6 +2106,40 @@ mod tests {
     // -----------------------------------------------------------------------
     // Full happy path (regression)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_signer_configuration_change_invalidates_queued_proposal() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("stale"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        assert_eq!(ctx.client.get_proposal(&id).signer_generation, 0);
+
+        ctx.client.remove_signer(&ctx.signer_c);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::InvalidSignerGeneration))
+        );
+        assert!(!ctx.client.get_proposal(&id).executed);
+    }
+
+    #[test]
+    fn test_proposal_after_signer_configuration_change_executes() {
+        let ctx = Ctx::setup();
+        ctx.client.remove_signer(&ctx.signer_c);
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("fresh"));
+        assert_eq!(ctx.client.get_proposal(&id).signer_generation, 1);
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        assert!(ctx.client.try_execute(&Address::generate(&ctx.env), &id).is_ok());
+    }
+
 
     #[test]
     fn test_full_governance_flow() {
