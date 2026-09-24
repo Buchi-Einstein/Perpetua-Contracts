@@ -24,6 +24,9 @@ project exists to build, verify and release it with integrity.
 > **Read [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) before relying on this.**
 > A green suite here does not mean TTL is solved — the archival *recovery* flow
 > is not yet proven against a live network. See §1 there, and the summary below.
+>
+> **Read [docs/threat_model.md](docs/threat_model.md) for a structured analysis of
+> trust boundaries, actor capabilities, and mitigations.**
 
 ## The project is divided in two
 
