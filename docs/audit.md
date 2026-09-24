@@ -51,3 +51,23 @@ Last verified: 2026-08-29 (PR #1665)
 |---|---|
 | `extend_stream_ttl` | Extend a single stream's storage TTL |
 | `batch_extend_ttl` | Extend multiple streams' storage TTLs |
+
+## Reentrancy Resistance
+
+All withdrawal and token-transfer paths follow the **Checks-Effects-Interactions**
+pattern. In `apply_withdrawal` (`src/lib.rs`):
+
+1. `stream.withdrawn` is updated and `stream.status` is possibly set to `Depleted`.
+2. `storage::save_stream` persists the updated stream state.
+3. `token_transfer` moves tokens to the recipient.
+
+State is written **before** the external token contract is called. Soroban's
+host forbids contract reentrancy by default, so even a malicious or buggy token
+contract cannot call back into `FluxoraStream` mid-transfer. If the token
+transfer fails (insufficient balance, deauthorized recipient, host trap), the
+Soroban host unwinds the entire transaction and no storage write is committed.
+
+This ordering is verified by `withdrawal_atomicity.rs`, which engineers two
+failure modes — SAC `set_authorized(recipient, false)` and an always-panicking
+token contract — and asserts that stream state and token balances are
+byte-for-byte identical before and after the failed call.

@@ -1135,7 +1135,7 @@ impl AuthAction {
     fn args(self, h: &Harness, stream_id: u64, stream: &Stream, caller: &Address) -> Vec<Val> {
         match self {
             AuthAction::Withdraw => (stream_id, None::<i128>).into_val(&h.env),
-            AuthAction::BatchWithdraw => (caller, h.ids(&[stream_id])).into_val(&h.env),
+            AuthAction::BatchWithdraw => (h.ids(&[stream_id]),).into_val(&h.env),
             AuthAction::TransferRecipient => {
                 (stream_id, self.transfer_target(h, stream)).into_val(&h.env)
             }
