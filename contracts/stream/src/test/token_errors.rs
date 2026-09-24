@@ -57,8 +57,6 @@ use soroban_sdk::{contract, contractimpl, Address, Env, MuxedAddress, String};
 use super::common::*;
 use crate::{Error, StreamStatus};
 
-// ─── panic token ─────────────────────────────────────────────────────────────
-
 /// A minimal token contract whose `transfer` always panics.
 ///
 /// In WASM execution on a real network a `panic!` produces
@@ -117,6 +115,62 @@ impl PanicToken {
 
 fn register_panic_token(h: &Harness) -> Address {
     h.env.register(PanicToken, ())
+}
+
+// ─── reentrant token ─────────────────────────────────────────────────────────
+
+/// A malicious token contract that attempts to call back into the stream
+/// contract during `transfer()` to test reentrancy defenses.
+///
+/// Soroban forbids reentrancy outright — the host rejects any nested contract
+/// invocation that targets the same transaction's call stack.  This contract
+/// documents the boundary: even if a token tries to call `withdraw` or
+/// `get_stream` during its `transfer`, the host aborts the sub-invocation and
+/// the stream contract's state remains intact.
+#[contract]
+pub struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn transfer(_env: Env, _from: Address, _to: MuxedAddress, _amount: i128) {}
+
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        1_000_000 * ONE
+    }
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+    pub fn approve(
+        _env: Env,
+        _from: Address,
+        _spender: Address,
+        _amount: i128,
+        _live_until_ledger: u32,
+    ) {
+    }
+    pub fn transfer_from(
+        _env: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _amount: i128,
+    ) {
+    }
+    pub fn burn(_env: Env, _from: Address, _amount: i128) {}
+    pub fn burn_from(_env: Env, _spender: Address, _from: Address, _amount: i128) {}
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn name(env: Env) -> String {
+        String::from_str(&env, "ReentrantToken")
+    }
+    pub fn symbol(env: Env) -> String {
+        String::from_str(&env, "RENT")
+    }
+}
+
+fn register_reentrant_token(h: &Harness) -> Address {
+    h.env.register(ReentrantToken, ())
 }
 
 // ─── clawback-enabled SAC ────────────────────────────────────────────────────
