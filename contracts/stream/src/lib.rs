@@ -757,6 +757,79 @@ impl FluxoraStream {
         Ok(())
     }
 
+    /// Atomically transfer ownership of multiple streams to a new recipient in a
+    /// single call.
+    ///
+    /// All validations run before any state is mutated, so a single bad id
+    /// anywhere in the batch reverts the entire call — no accounting is written,
+    /// no events are emitted, and no tokens move.
+    ///
+    /// # Authorization
+    ///
+    /// The **sender** of every stream in the batch must authorize this call.
+    /// Unlike [`transfer_recipient`](Self::transfer_recipient), the sender's
+    /// auth is checked once up front rather than per-stream.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::EmptyBatch`] — `stream_ids` is empty.
+    /// * [`Error::BatchTooLarge`] — more than [`MAX_BATCH_SIZE`] ids.
+    /// * [`Error::DuplicateStreamId`] — the same id appears twice.
+    /// * [`Error::MalformedStreamId`] — an element does not decode as `u64`.
+    /// * [`Error::StreamNotFound`] — any id does not exist.
+    /// * [`Error::NotTransferable`] — any stream was created with
+    ///   `transferable == false`.
+    /// * [`Error::StreamTerminated`] — any stream is cancelled or fully
+    ///   depleted.
+    /// * [`Error::SelfStream`] — `new_recipient` is the sender of any stream.
+    /// * [`Error::RepeatedTransfer`] — any stream's current recipient already
+    ///   equals `new_recipient`.
+    /// * [`Error::Unauthorized`] — caller is not the sender of any stream.
+    pub fn batch_transfer_recipient(
+        env: Env,
+        stream_ids: Vec<u64>,
+        new_recipient: Address,
+    ) -> Result<u32, Error> {
+        let stream_ids = Self::validate_batch_ids(&env, &stream_ids)?;
+        Self::reject_duplicate_ids(&stream_ids)?;
+
+        let mut validated = Vec::new(&env);
+        for stream_id in stream_ids.iter() {
+            let stream = storage::peek_stream(&env, stream_id)?;
+            validated.push_back((*stream_id, stream));
+        }
+
+        let sender = validated.get_unchecked(0).1.sender.clone();
+        sender.require_auth();
+
+        let mut transferred = 0u32;
+        for (stream_id, stream) in validated.iter() {
+            let mut stream = stream.clone();
+            if !stream.transferable {
+                return Err(Error::NotTransferable);
+            }
+            if stream.status == StreamStatus::Depleted || stream.withdrawn >= stream.deposited {
+                return Err(Error::StreamTerminated);
+            }
+            if stream.sender != sender {
+                return Err(Error::Unauthorized);
+            }
+            if new_recipient == stream.sender {
+                return Err(Error::SelfStream);
+            }
+            if stream.recipient == new_recipient {
+                return Err(Error::RepeatedTransfer);
+            }
+            let old_recipient = stream.recipient.clone();
+            stream.recipient = new_recipient.clone();
+            storage::save_stream(&env, *stream_id, &stream);
+            events::recipient_transferred(&env, *stream_id, &old_recipient, &new_recipient);
+            transferred += 1;
+        }
+
+        Ok(transferred)
+    }
+
     // ---------------------------------------------------------------------
     // Delegation
     // ---------------------------------------------------------------------
@@ -1204,10 +1277,11 @@ impl FluxoraStream {
         let stream_ids = Self::validate_batch_ids(&env, &stream_ids)?;
         Self::reject_duplicate_ids(&stream_ids)?;
 
+        let now = env.ledger().timestamp();
         let mut extended = 0u32;
         for stream_id in stream_ids.iter() {
             if let Ok(stream) = storage::peek_stream(&env, stream_id) {
-                let target = storage::ttl_target_ledgers(&env, &stream);
+                let target = storage::ttl_target_ledgers_at(&env, &stream, now);
                 storage::extend_stream(&env, stream_id, &stream);
                 events::ttl_extended(&env, stream_id, target);
                 extended += 1;
