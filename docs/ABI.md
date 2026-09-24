@@ -187,6 +187,8 @@ is the snake_case event name, second is always `stream_id`.
 |---|---|---|
 | `stream_created` | `stream_id`, `sender`, `recipient` | `token`, `deposited`, `start_time`, `end_time`, `cliff_time`, `cancellable`, `pausable`, `transferable` |
 | `withdrawn` | `stream_id`, `recipient` | `amount`, `withdrawn`, `deposited`, `status` |
+
+`stream_created` is the bootstrap event indexers use to reconstruct a stream's initial state. It is the only source of the per-stream metadata needed to build a sender/recipient mapping before any later lifecycle event arrives.
 | `cancelled` | `stream_id`, `sender`, `recipient` | `refunded`, `vested`, `withdrawn`, `end_time` |
 | `paused` | `stream_id`, `sender` | `paused_at`, `paused_total` |
 | `resumed` | `stream_id`, `sender` | `paused_duration`, `paused_total` |
