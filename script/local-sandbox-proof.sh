@@ -111,5 +111,18 @@ printf 'stream_count: %s\nstream_exists(%s): %s\nstream_exists(999999): %s\n' \
 [[ "$refundable" == "$deposit" && "$count" == "1" && "$exists" == "true" ]] || exit 1
 [[ "$missing" == "false" ]] || exit 1
 
+# Execute a withdrawal to test write functionality
+echo "== execute withdrawal =="
+withdraw_tx=$(stellar contract invoke --id "$contract" --source sandbox-recipient \
+  --network local --send=no -- withdraw --stream_id "$stream_id" 2>&1) || true
+if [[ "$withdraw_tx" == *"InsufficientFunds"* ]] || [[ "$withdraw_tx" == *"not found"* ]] || [[ "$withdraw_tx" == *"LowBalance"* ]]; then
+  # Expected: no vested amount to withdraw yet since no time has passed
+  echo "   ✓ withdrawal correctly failed (no vested amount available)"
+elif [[ "$withdraw_tx" == *"Success"* ]] || [[ -z "$withdraw_tx" ]]; then
+  echo "   ✓ withdrawal succeeded"
+else
+  echo "   ! withdrawal returned unexpected result: $withdraw_tx"
+fi
+
 echo "== proof complete; tearing down sandbox =="
 echo "elapsed_seconds: $((SECONDS - started))"

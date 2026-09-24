@@ -59,8 +59,11 @@ through a shared build artifact.
 
 # Deeper randomized sweep. CI runs this nightly; worth running before a release
 # or after touching accrual.rs. Both suites have found real bugs.
-FLUXORA_FUZZ_SEEDS=200 FLUXORA_FUZZ_STEPS=300 PROPTEST_CASES=5000 \
+FLUXORA_FUZZ_SEEDS=500 FLUXORA_FUZZ_STEPS=1000 PROPTEST_CASES=5000 \
   (cd contracts/stream && cargo test --release)
+
+# Local end-to-end testing with standalone Soroban network:
+script/local-sandbox-proof.sh
 ```
 
 ## Building and releasing
