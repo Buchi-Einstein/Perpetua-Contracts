@@ -18,7 +18,8 @@
 //! respect caps and minimums pins this contract in front of stream creation.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, vec, Address, Env,
+    Error, IntoVal, Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +101,14 @@ pub enum FactoryError {
     Unauthorized = 3,
     /// The recipient is not allowlisted.
     AllowlistDenied = 4,
+    CreationPaused = 5,
+    DepositExceedsCap = 6,
+    DurationTooShort = 7,
+    InvalidTimeRange = 8,
+    InvalidCliff = 9,
+    RateBelowMin = 10,
+    RateAboveMax = 11,
+    StreamCreationFailed = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +237,79 @@ impl FluxoraFactory {
             |e| panic_with_error!(&env, e),
             |config| config.creation_paused,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, FactoryError> {
+        let policy = load_policy(&env)?;
+        if policy.creation_paused {
+            return Err(FactoryError::CreationPaused);
+        }
+        if deposit > policy.max_deposit {
+            return Err(FactoryError::DepositExceedsCap);
+        }
+        if start_time >= end_time {
+            return Err(FactoryError::InvalidTimeRange);
+        }
+        if cliff_time < start_time || cliff_time > end_time {
+            return Err(FactoryError::InvalidCliff);
+        }
+
+        let duration = end_time - start_time;
+        if duration < policy.min_duration {
+            return Err(FactoryError::DurationTooShort);
+        }
+
+        if policy.min_rate_per_second.is_some() || policy.max_rate_per_second.is_some() {
+            let rate_per_second = deposit / duration as i128;
+            if policy
+                .min_rate_per_second
+                .is_some_and(|minimum| rate_per_second < minimum)
+            {
+                return Err(FactoryError::RateBelowMin);
+            }
+            if policy
+                .max_rate_per_second
+                .is_some_and(|maximum| rate_per_second > maximum)
+            {
+                return Err(FactoryError::RateAboveMax);
+            }
+        }
+
+        sender.require_auth();
+        let args = vec![
+            &env,
+            sender.into_val(&env),
+            recipient.into_val(&env),
+            token.into_val(&env),
+            deposit.into_val(&env),
+            start_time.into_val(&env),
+            end_time.into_val(&env),
+            cliff_time.into_val(&env),
+            cancellable.into_val(&env),
+            pausable.into_val(&env),
+            transferable.into_val(&env),
+        ];
+        match env.try_invoke_contract::<u64, Error>(
+            &policy.stream_contract,
+            &Symbol::new(&env, "create_stream"),
+            args,
+        ) {
+            Ok(Ok(stream_id)) => Ok(stream_id),
+            _ => Err(FactoryError::StreamCreationFailed),
+        }
     }
 
     // -----------------------------------------------------------------------
