@@ -26,6 +26,8 @@ mod props;
 mod withdraw;
 // Issue #1583: withdrawal return value matches emitted amounts.
 mod withdraw_events;
+// Reads get, stream_count, exists + TTL side-effect freedom.
+mod read_methods_no_side_effects;
 
 // Stage 2
 mod auth;
@@ -36,6 +38,7 @@ mod cancel_events;
 mod cliff;
 mod delegation;
 mod pause;
+mod race_cancel_withdraw;
 mod storage_keys;
 mod terminal_operations;
 mod token_errors;
