@@ -1,5 +1,9 @@
 # Migration: `main` → `v1-rewrite`
 
+> **For developers on a legacy (pre-rewrite, v0) deployment**, jump to
+> [§8 Step-by-step migration](#8-step-by-step-migration-for-developers-on-legacy-contracts).
+> Everything before it is the deletion audit that justifies the steps.
+
 Deletion audit for the v1 rewrite. Two questions, answered in order:
 
 1. What did the disabled tests cover, and is any of it now *silently* missing
@@ -326,3 +330,61 @@ incentive is both narrow and adversarially shaped.
 The problem it solves is also not real in v1: an unwithdrawn stream costs the
 contract nothing, TTL is handled by the permissionless rent path, and the
 recipient's claim never expires.
+
+---
+
+## 8. Step-by-step migration for developers on legacy contracts
+
+This is the how-to companion to the audit above. It assumes you integrate
+against the v1 ABI ([docs/ABI.md](ABI.md), frozen) and can redeploy or re-point
+your integration at the v1 contract address.
+
+**1. Drop `factory` / `governance` from your config.** v1 is one contract. Point
+every call at the single v1 address; remove `factory` / `governance` /
+`timelock` address handling. There is no `init`, no admin key, no upgrade path —
+nothing to configure at deploy time.
+
+**2. Choose the token.** The token is now a *per-stream* argument, not a global
+set at `init`. Pick your SEP-41 token and pass it into every `create_stream`.
+
+**3. Update the four destructive call sites** (see the rename table in §4):
+
+| legacy (v0) | v1 |
+|---|---|
+| `create_stream(sender, recipient, amount, start, end, cliff)` | `create_stream(sender, recipient, token, deposit, start, end, cliff, cancellable, pausable, transferable)` |
+| `withdraw(recipient, id, amount)` | `withdraw(id, amount: Option<i128>)` — `None` withdraws the max |
+| `pause_stream(sender, id)` / `resume_stream(sender, id)` | `pause(id)` / `resume(id)` — no `sender` arg |
+| `cancel_stream(sender, id)` | `cancel(id)` — no `sender` arg |
+
+**4. Delete the `sender` argument everywhere.** The contract reads it from the
+stream; callers no longer pass it.
+
+**5. Change all amounts to `i128`.** Legacy integrations encoding with
+`encodeU64` must switch to signed-128 encoding per the SEP-41 interface.
+
+**6. Handle `withdraw` return / view renames.** `get_stream_state` → `get_stream`,
+`get_withdrawable` → `withdrawable_of`, `calculate_accrued` → `vested_of`,
+`get_stream_count` → `stream_count`. Views have no TTL side effects; do not rely
+on them to keep entries alive — call `extend_stream_ttl` / `batch_extend_ttl`
+instead.
+
+**7. Accept the behavioural deltas.** No withdrawal rate limiting (a recipient
+may withdraw every ledger), no delegated/keeper operations, no batched creation,
+no id reservation, and `update_rate` / `extend_stream_end_time` are gone —
+`top_up(id, amount)` is the only schedule mutation and it extends *duration* at a
+constant rate. Stream flags `cancellable` / `pausable` / `transferable` are set
+once, at creation, and never change.
+
+**8. Map statuses back to your old enum.** v1 emits
+`Active | Paused | Cancelled | Depleted`. Projects storing
+`('active','paused','completed','cancelled')` should map `Depleted → completed`
+(or widen the check). Note `Cancelled` is sticky: a cancelled stream drained to
+zero stays `Cancelled`.
+
+**9. Compute `rate_per_second`, do not store it.** v1 stores no rate; derive it
+as `deposited / duration` and recompute after `top_up`.
+
+**10. Re-key your indexer on events.** Every v1 event carries `stream_id` as a
+topic plus the addresses an indexer routes on. Generate typed decoders from the
+deployed interface spec (`#[contractevent]`) instead of hand-rolling topic
+parsers; field order and topic placement are ABI.
