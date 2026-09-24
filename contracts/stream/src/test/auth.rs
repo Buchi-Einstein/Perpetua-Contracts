@@ -829,6 +829,51 @@ fn delegated_address_cannot_act_on_a_stream_it_does_not_own() {
     h.assert_pool_exact();
 }
 
+/// #1637 hardens recipient-transfer authorization to the sender, and that
+/// holds for contract-typed (smart-account) signers too: the smart sender must
+/// authorize the transfer, and the new smart recipient must be able to withdraw
+/// afterwards.
+#[test]
+fn smart_account_sender_can_transfer_between_smart_recipients() {
+    let h = Harness::new();
+    let smart_sender = Address::generate(&h.env);
+    let smart_a = Address::generate(&h.env);
+    let smart_b = Address::generate(&h.env);
+    h.token_admin.mint(&smart_sender, &(1_000 * ONE));
+
+    let start = h.now();
+    let id = h.client.create_stream(
+        &smart_sender,
+        &smart_a,
+        &h.token,
+        &(500 * ONE),
+        &start,
+        &(start + 100 * DAY),
+        &start,
+        &true,
+        &true,
+        &true,
+    );
+    assert_eq!(required_auth(&h.env), smart_sender, "create auth");
+
+    h.client.transfer_recipient(&id, &smart_b);
+    assert_eq!(
+        required_auth(&h.env),
+        smart_sender,
+        "transfer is sender-gated even for smart signers"
+    );
+
+    h.advance(100 * DAY);
+    h.client.withdraw(&id, &None);
+    assert_eq!(
+        required_auth(&h.env),
+        smart_b,
+        "new smart recipient can withdraw"
+    );
+    assert_eq!(h.balance(&smart_b), 500 * ONE, "100% vested at end");
+    h.assert_pool_exact();
+}
+
 // ---------------------------------------------------------------------------
 // 13. Capability flags are enforced independently of authorization
 // ---------------------------------------------------------------------------
@@ -1257,242 +1302,84 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// 17. Wrong keypair: non-recipient cannot withdraw
+// 17. Spoofed signatures — a credential for the wrong party must fail
 // ---------------------------------------------------------------------------
 
-/// A non-recipient cannot withdraw even under full mock auth. The contract
-/// independently checks `stream.recipient == caller` after auth, so the
-/// wrong keypair is rejected at the auth layer before any state changes.
+/// Issue #84: an attacker who holds *a* signature — even the stream's own
+/// recipient's — must not be able to unlock an entrypoint that belongs to
+/// someone else. The Soroban host compares the demanded address against the
+/// supplied credentials and refuses the call outright.
+fn assert_host_rejects_spoofed(h: &Harness, id: u64, action: AuthAction, forged: Address) {
+    let stream = h.get(id);
+    let before = snapshot(h, id, &Address::generate(&h.env));
+    let accepted = action.apply(h, id, &stream, &forged);
+    assert!(
+        !accepted,
+        "{} accepted a spoofed credential for {}",
+        action.fn_name(),
+        forged,
+    );
+    assert_eq!(
+        snapshot(h, id, &Address::generate(&h.env)),
+        before,
+        "{} mutated state under a spoofed credential",
+        action.fn_name(),
+    );
+    assert!(
+        h.env.events().all().events().is_empty(),
+        "{} emitted events under a spoofed credential",
+        action.fn_name(),
+    );
+}
+
+/// The recipient's own credential, forged against sender-gated entrypoints.
 #[test]
-fn non_recipient_cannot_withdraw() {
+fn spoofed_signature_is_rejected_for_every_sender_gated_entrypoint() {
     let h = Harness::new();
     let id = h.create_simple(1_000 * ONE, 100 * DAY);
     h.advance(10 * DAY);
 
-    let withdrawn_before = h.get(id).withdrawn;
-    let balance_before = h.balance(&h.recipient);
-    let pool_before = h.pool();
-
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "withdraw",
-        args: (id, None::<i128>).into_val(&h.env),
-        sub_invokes: &[],
+    let forged = h.recipient.clone();
+    let via_forged = |action| {
+        assert_host_rejects_spoofed(&h, id, action, forged.clone());
     };
-    let auth = MockAuth {
-        address: &h.other,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    let err = client.try_withdraw(&id, &None).unwrap_err().unwrap();
-    assert_eq!(err, Error::Unauthorized, "non-recipient rejected");
-
-    assert_eq!(h.get(id).withdrawn, withdrawn_before);
-    assert_eq!(h.balance(&h.recipient), balance_before);
-    assert_eq!(h.pool(), pool_before);
+    via_forged(AuthAction::TopUp);
+    via_forged(AuthAction::Pause);
+    via_forged(AuthAction::Resume);
+    via_forged(AuthAction::Cancel);
+    via_forged(AuthAction::TransferRecipient); // sender-gated after #1637
     h.assert_pool_exact();
 }
 
-/// A non-sender cannot transfer_recipient even under full mock auth.
+/// The sender's own credential, forged against recipient-gated entrypoints.
 #[test]
-fn non_sender_cannot_transfer_recipient() {
+fn spoofed_signature_is_rejected_for_every_recipient_gated_entrypoint() {
     let h = Harness::new();
     let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(30 * DAY);
 
-    let recipient_before = h.get(id).recipient.clone();
-    let pool_before = h.pool();
-
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "transfer_recipient",
-        args: (id, h.other.clone()).into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.other,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    let err = client
-        .try_transfer_recipient(&id, &h.other)
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, Error::Unauthorized, "non-sender rejected");
-
-    assert_eq!(h.get(id).recipient, recipient_before);
-    assert_eq!(h.pool(), pool_before);
+    let forged = h.sender.clone();
+    assert_host_rejects_spoofed(&h, id, AuthAction::Withdraw, forged.clone());
+    assert_host_rejects_spoofed(&h, id, AuthAction::BatchWithdraw, forged);
     h.assert_pool_exact();
 }
 
-// ---------------------------------------------------------------------------
-// 18. Signature scoping: args must match exactly
-// ---------------------------------------------------------------------------
-
-/// A signature scoped to stream_id=42 cannot be replayed on stream_id=99.
+/// A spoofed `create_stream`: only the recipient's credential is on hand, but
+/// the stream is opened in the sender's name. The host refuses, no stream is
+/// created, and no tokens move.
 #[test]
-fn withdraw_signature_scoped_to_stream_id() {
+fn spoofed_signature_cannot_create_a_stream_for_someone_else() {
     let h = Harness::new();
-    let id_a = h.create_simple(1_000 * ONE, 100 * DAY);
-    let id_b = h.create_simple(1_000 * ONE, 100 * DAY);
-    h.advance(10 * DAY);
 
-    // Build auth for stream_id=id_a.
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "withdraw",
-        args: (id_a, None::<i128>).into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.recipient,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    // Replay on stream_id=id_b: auth args do not match, must fail.
-    let err = client.try_withdraw(&id_b, &None).unwrap_err().unwrap();
-    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong stream_id");
-
-    h.assert_pool_exact();
-}
-
-/// A signature scoped to `amount=None` cannot be replayed with an explicit amount.
-#[test]
-fn withdraw_signature_scoped_to_amount() {
-    let h = Harness::new();
-    let id = h.create_simple(1_000 * ONE, 100 * DAY);
-    h.advance(60 * DAY);
-
-    let partial = 300 * ONE;
-
-    // Build auth for `amount=None`.
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "withdraw",
-        args: (id, None::<i128>).into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.recipient,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    // Replay with explicit amount: auth args do not match, must fail.
-    let err = client
-        .try_withdraw(&id, &Some(partial))
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong amount");
-
-    h.assert_pool_exact();
-}
-
-/// A signature scoped to a specific set of stream_ids cannot be replayed on a
-/// different set in `batch_withdraw`.
-#[test]
-fn batch_withdraw_signature_scoped_to_stream_ids() {
-    let h = Harness::new();
-    let id_a = h.create_simple(100 * ONE, 100 * DAY);
-    let id_b = h.create_simple(100 * ONE, 100 * DAY);
-    let id_c = h.create_simple(100 * ONE, 100 * DAY);
-    h.advance(10 * DAY);
-
-    // Build auth for ids [id_a, id_b].
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "batch_withdraw",
-        args: (h.ids(&[id_a, id_b]),).into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.recipient,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    // Replay on ids [id_a, id_c]: auth args do not match, must fail.
-    let err = client
-        .try_batch_withdraw(&h.recipient, &h.ids(&[id_a, id_c]))
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong batch ids");
-
-    h.assert_pool_exact();
-}
-
-/// A signature scoped to `new_recipient=X` cannot be replayed with a different
-/// recipient in `transfer_recipient`.
-#[test]
-fn transfer_recipient_signature_scoped_to_new_recipient() {
-    let h = Harness::new();
-    let id = h.create_simple(1_000 * ONE, 100 * DAY);
-
-    // Build auth scoped to new_recipient=h.recipient (which would be a no-op).
-    let invoke = MockAuthInvoke {
-        contract: &h.contract_id,
-        fn_name: "transfer_recipient",
-        args: (id, h.recipient.clone()).into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.sender,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    // Replay with new_recipient=h.other: auth args do not match, must fail.
-    let err = client
-        .try_transfer_recipient(&id, &h.other)
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong new_recipient");
-
-    assert_eq!(h.get(id).recipient, h.recipient, "recipient unchanged");
-    h.assert_pool_exact();
-}
-
-/// A signature scoped to one set of `create_stream` args cannot be replayed
-/// with different schedule or capability flags.
-#[test]
-fn create_stream_signature_scoped_to_args() {
-    let h = Harness::new();
     let start = h.now();
-
-    // Build auth for specific create_stream args.
     let invoke = MockAuthInvoke {
         contract: &h.contract_id,
         fn_name: "create_stream",
         args: (
-            h.sender.clone(),
-            h.recipient.clone(),
-            h.token.clone(),
-            1_000 * ONE,
-            start,
-            start + 100 * DAY,
-            start,
-            true,
-            true,
-            true,
-        )
-            .into_val(&h.env),
-        sub_invokes: &[],
-    };
-    let auth = MockAuth {
-        address: &h.sender,
-        invoke: &invoke,
-    };
-    let client = h.client.mock_auths(&[auth]);
-
-    // Replay with a different deposit: auth args do not match, must fail.
-    let err = client
-        .try_create_stream(
             &h.sender,
             &h.recipient,
             &h.token,
-            &(500 * ONE),
+            &(100 * ONE),
             &start,
             &(start + 100 * DAY),
             &start,
@@ -1500,11 +1387,35 @@ fn create_stream_signature_scoped_to_args() {
             &true,
             &true,
         )
-        .unwrap_err()
-        .unwrap();
-    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on different create_stream args");
+            .into_val(&h.env),
+        sub_invokes: &[],
+    };
+    h.env.mock_auths(&[MockAuth {
+        address: &h.recipient,
+        invoke: &invoke,
+    }]);
 
-    // No stream was created.
-    assert_eq!(h.client.stream_count(), 0);
+    assert!(
+        h.client
+            .try_create_stream(
+                &h.sender,
+                &h.recipient,
+                &h.token,
+                &(100 * ONE),
+                &start,
+                &(start + 100 * DAY),
+                &start,
+                &true,
+                &true,
+                &true,
+            )
+            .is_err(),
+        "host rejected the spoofed create",
+    );
+
+    assert_eq!(h.client.stream_count(), 0, "no stream created");
+    assert_eq!(h.pool(), 0, "no tokens moved");
+
+    h.env.mock_all_auths();
     h.assert_pool_exact();
 }

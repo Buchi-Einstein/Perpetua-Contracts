@@ -86,45 +86,95 @@ fn run_lifecycle_sequence(seed: u64, steps: u32) {
         let vested_before = h.vested_snapshot();
 
         // Apply a random lifecycle operation
-        match rng.below(10) {
-            0..=3 => {
-                // Withdraw
-                let amount = if rng.below(2) == 0 {
-                    None
-                } else {
-                    Some((1 + rng.below(100)) as i128 * ONE)
-                };
-                let _ = h.client.try_withdraw(&id, &amount);
+        match rng.below(11) {
+            0 => {
+                // Create stream
+                if h.client.stream_count() < 10 {  // Limit total streams to prevent excessive growth
+                    let start = h.now() + rng.below(10 * DAY);
+                    let duration = DAY + rng.below(5 * DAY);
+                    let end = start + duration;
+                    let cliff = start;
+                    let deposit = duration as i128 * ONE;
+                    let _ = h.client.try_create_stream(
+                        &h.sender,
+                        &h.recipient,
+                        &h.token,
+                        &deposit,
+                        &start,
+                        &end,
+                        &cliff,
+                        &true,
+                        &true,
+                        &true,
+                    );
+                }
             }
-            4 => {
-                // Pause
-                let _ = h.client.try_pause(&id);
+            1..=4 => {
+                // Withdraw
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let amount = if rng.below(2) == 0 {
+                        None
+                    } else {
+                        Some((1 + rng.below(100)) as i128 * ONE)
+                    };
+                    let _ = h.client.try_withdraw(&id, &amount);
+                }
             }
             5 => {
-                // Resume
-                let _ = h.client.try_resume(&id);
+                // Pause
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let _ = h.client.try_pause(&id);
+                }
             }
             6 => {
-                // Cancel
-                let _ = h.client.try_cancel(&id);
+                // Resume
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let _ = h.client.try_resume(&id);
+                }
             }
             7 => {
-                // Top-up
-                let amount = (1 + rng.below(5)) as i128 * ONE;
-                let _ = h.client.try_top_up(&id, &amount);
+                // Cancel
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let _ = h.client.try_cancel(&id);
+                }
             }
             8 => {
+                // Top-up
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let amount = (1 + rng.below(5)) as i128 * ONE;
+                    let _ = h.client.try_top_up(&id, &amount);
+                }
+            }
+            9 => {
                 // Transfer recipient
-                let to = if rng.below(2) == 0 {
-                    h.other.clone()
-                } else {
-                    h.recipient.clone()
-                };
-                let _ = h.client.try_transfer_recipient(&id, &to);
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let to = if rng.below(2) == 0 {
+                        h.other.clone()
+                    } else {
+                        h.recipient.clone()
+                    };
+                    let _ = h.client.try_transfer_recipient(&id, &to);
+                }
             }
             _ => {
                 // Extend TTL (maintenance operation)
-                let _ = h.client.try_extend_stream_ttl(&id);
+                let count = h.client.stream_count();
+                if count > 0 {
+                    let id = rng.below(count);
+                    let _ = h.client.try_extend_stream_ttl(&id);
+                }
             }
         }
 

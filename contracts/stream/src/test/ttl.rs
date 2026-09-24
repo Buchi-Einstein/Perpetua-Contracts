@@ -373,6 +373,106 @@ fn stream_ids_never_collide_after_a_restore() {
     assert_eq!(h.client.stream_count(), 2);
 }
 
+// --- Issue #97 — griefing analysis -----------------------------------------
+
+/// **Griefing: "extend a stream to lock its state"** — not possible. The
+/// permissionless path reads once (`peek_stream`) and writes only the entry's
+/// TTL; every field of the stream must be bit-identical before and after a
+/// sweep, whoever performs it and however often.
+#[test]
+fn extend_stream_ttl_leaves_stream_state_untouched() {
+    let h = Harness::new();
+    let id = h.create(
+        1_000 * ONE,
+        h.now(),
+        h.now() + 100 * DAY,
+        h.now() + 10 * DAY,
+        true,
+        true,
+        true,
+    );
+    h.advance(10 * DAY);
+    h.client.withdraw(&id, &Some(50 * ONE));
+    h.client.pause(&id);
+    let before = h.get(id);
+    let withdrawable_before = h.client.withdrawable_of(&id);
+
+    // A stranger with no relationship to the stream sweeps — twice, once via
+    // the single-item path and once via the batch path.
+    h.env.mock_auths(&[]);
+    h.client.extend_stream_ttl(&id);
+    h.client.batch_extend_ttl(&h.ids(&[id]));
+
+    assert_eq!(
+        h.get(id),
+        before,
+        "a TTL sweep rewrote a stream field — the keeper path is not pure rent"
+    );
+    h.assert_pool_exact();
+
+    // A paused stream stays paused, and its withdrawable balance is untouched:
+    // the sweep cannot free it, freeze it, or settle it.
+    assert_eq!(h.get(id).status, crate::StreamStatus::Paused);
+    assert_eq!(
+        h.client.withdrawable_of(&id),
+        withdrawable_before,
+        "the sweep changed the recipient's claim"
+    );
+}
+
+/// **Griefing: "starve a stream by sweeping it early"** — not possible. Soroban
+/// `extend_ttl` never reduces an entry's live-until, so neither the contract
+/// itself (a cancel collapsing the rent target) nor a swarm of permissionless
+/// sweeps can claw back rent a legitimate party already paid.
+#[test]
+fn permissionless_extension_cannot_reduce_existing_rent() {
+    let h = Harness::new();
+    h.env.ledger().set_max_entry_ttl(50_000);
+    let id = h.create_simple(1_000 * ONE, YEAR);
+    assert_eq!(ttl_of(&h, id), 50_000);
+
+    // A cancel collapses the stream's *natural* target to the floor, and the
+    // contract's own save path re-extends — but the entry keeps its higher
+    // funded rent.
+    h.advance(10 * DAY);
+    h.client.cancel(&id);
+    assert_eq!(
+        ttl_of(&h, id),
+        50_000,
+        "state collapse clawed back already-paid rent"
+    );
+
+    // An attacker computing the (much lower) cancelled-stream target can bump
+    // the TTL, but `extend_ttl` semantics leave the higher value in place.
+    h.env.mock_auths(&[]);
+    h.client.extend_stream_ttl(&id);
+    assert_eq!(ttl_of(&h, id), 50_000, "sweep reduced a funded entry");
+}
+
+/// **Griefing: "force a recipient's claim to be paid out / settled"** — not
+/// possible. The permissionless surface moves no tokens and transfers no state:
+/// sweeping a stream never changes what the recipient can withdraw today.
+#[test]
+fn a_sweep_cannot_change_what_is_withdrawable() {
+    let h = Harness::new();
+    h.env.ledger().set_max_entry_ttl(50_000);
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+    let withdrawable_before = h.client.withdrawable_of(&id);
+
+    h.env.mock_auths(&[]);
+    h.client.extend_stream_ttl(&id);
+    h.client.batch_extend_ttl(&h.ids(&[id]));
+
+    assert_eq!(
+        h.client.withdrawable_of(&id),
+        withdrawable_before,
+        "a sweep changed the recipient's withdrawable balance",
+    );
+    assert_eq!(h.balance(&h.recipient), 0, "a sweep moved tokens");
+    h.assert_pool_exact();
+}
+
 // --- Unit coverage of the rent arithmetic ----------------------------------
 
 #[test]

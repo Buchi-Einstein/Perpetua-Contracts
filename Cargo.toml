@@ -1,0 +1,1 @@
+[package]\nname = "perpetua-contracts"\nversion = "0.1.0"\n\n[toolchain]\nchannel = "stable"
