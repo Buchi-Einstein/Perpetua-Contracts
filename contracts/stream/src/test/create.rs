@@ -128,9 +128,9 @@ fn create_records_every_field() {
     assert_eq!(s.start_time, start);
     assert_eq!(s.end_time, end);
     assert_eq!(s.cliff_time, cliff);
-    assert!(s.cancellable);
-    assert!(!s.pausable);
-    assert!(s.transferable);
+    assert!(s.cancellable());
+    assert!(!s.pausable());
+    assert!(s.transferable());
     assert_eq!(s.paused_at, None);
     assert_eq!(s.paused_total, 0);
     assert_eq!(s.status, StreamStatus::Active);
