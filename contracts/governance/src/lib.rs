@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::FromXdr, Address,
-    Bytes, Env, IntoVal, Map, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,8 @@ pub enum CallData {
     FactorySetAllowlist(Address, bool),
     /// `set_stream_contract(new_stream_contract)`
     FactorySetStreamContract(Address),
+    /// `set_stream_wasm_hash(reviewed_wasm_hash)`
+    FactorySetStreamWasmHash(BytesN<32>),
 }
 
 /// Decode `calldata` bytes into a `CallData` variant and invoke the target.
@@ -245,6 +247,13 @@ fn dispatch_call(env: &Env, target: &Address, calldata: &Bytes) -> Result<(), Go
                 target,
                 &Symbol::new(env, "set_stream_contract"),
                 (new_contract,).into_val(env),
+            );
+        }
+        CallData::FactorySetStreamWasmHash(new_hash) => {
+            env.invoke_contract::<()>(
+                target,
+                &Symbol::new(env, "set_stream_wasm_hash"),
+                (new_hash,).into_val(env),
             );
         }
     }
