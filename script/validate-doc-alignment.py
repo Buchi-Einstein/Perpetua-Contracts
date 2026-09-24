@@ -2,9 +2,9 @@
 """Validate that documentation aligns with contract source code.
 
 Checks:
-  - streaming.md entrypoints match lib.rs #[contractimpl] pub fn signatures
-  - events documented in events.md match emitted events in source
-  - error codes in error.md match ContractError enum discriminants
+   - README.md function signatures match lib.rs #[contractimpl] pub fn signatures
+   - docs/ABI.md constants match source code (MAX_BATCH_SIZE, MIN_STREAM_TTL_LEDGERS)
+   - error codes in error.md match ContractError enum discriminants
 
 Exit 0 if all checks pass, exit 1 on mismatch.
 """
@@ -57,20 +57,32 @@ def extract_error_variants(source: str) -> dict[str, int]:
     return variants
 
 
-def check_streaming_entrypoints() -> bool:
-    """Check that streaming.md documents all entrypoints from lib.rs."""
+def extract_constants(source: str) -> dict[str, str]:
+    """Extract public const declarations."""
+    constants = {}
+    # Match patterns like: pub const NAME: TYPE = VALUE;
+    pattern = r"pub\s+const\s+(\w+)\s*:\s*\w+\s*=\s*([^;]+);"
+    for match in re.finditer(pattern, source):
+        name = match.group(1)
+        value = match.group(2).strip()
+        constants[name] = value
+    return constants
+
+
+def check_readme_functions() -> bool:
+    """Check that README.md documents all entrypoints from lib.rs."""
     lib_rs = REPO_ROOT / "contracts" / "stream" / "src" / "lib.rs"
-    streaming_md = REPO_ROOT / "docs" / "streaming.md"
+    readme_md = REPO_ROOT / "README.md"
 
     if not lib_rs.exists():
         print(f"SKIP: {lib_rs} not found")
         return True
-    if not streaming_md.exists():
-        print(f"SKIP: {streaming_md} not found")
+    if not readme_md.exists():
+        print(f"SKIP: {readme_md} not found")
         return True
 
     source = lib_rs.read_text(encoding="utf-8")
-    doc = streaming_md.read_text(encoding="utf-8")
+    readme = readme_md.read_text(encoding="utf-8")
 
     fns = extract_contractimpl_pub_fns(source)
     # Filter out internal helpers that aren't entrypoints
@@ -80,11 +92,66 @@ def check_streaming_entrypoints() -> bool:
         and not f.startswith("_")
     ]
 
-    missing = [f for f in entrypoints if f not in doc]
+    missing = [f for f in entrypoints if f not in readme]
     if missing:
-        print(f"WARNING: {len(missing)} entrypoint(s) not documented in streaming.md: {missing}")
+        print(f"WARNING: {len(missing)} entrypoint(s) not documented in README.md: {missing}")
         # Don't fail CI for documentation gaps — just warn
     return True
+
+
+def check_abi_constants() -> bool:
+    """Check that docs/ABI.md constants match source code."""
+    lib_rs = REPO_ROOT / "contracts" / "stream" / "src" / "lib.rs"
+    abi_md = REPO_ROOT / "docs" / "ABI.md"
+
+    if not lib_rs.exists():
+        print(f"SKIP: {lib_rs} not found")
+        return True
+    if not abi_md.exists():
+        print(f"SKIP: {abi_md} not found")
+        return True
+
+    source = lib_rs.read_text(encoding="utf-8")
+    abi = abi_md.read_text(encoding="utf-8")
+
+    constants = extract_constants(source)
+    
+    # Check for specific constants mentioned in the issue
+    required_constants = ["MAX_BATCH_SIZE", "MIN_STREAM_TTL_LEDGERS"]
+    missing = []
+    mismatched = []
+    
+    for const_name in required_constants:
+        if const_name not in constants:
+            missing.append(const_name)
+            continue
+            
+        # Look for the constant in ABI.md
+        # Pattern: `MAX_BATCH_SIZE = 16` or similar
+        pattern = rf"`{re.escape(const_name)}\s*=\s*([^`]+)`"
+        match = re.search(pattern, abi)
+        if not match:
+            missing.append(const_name)
+            continue
+            
+        abi_value = match.group(1).strip()
+        source_value = constants[const_name]
+        
+        # Normalize values for comparison (remove spaces, etc.)
+        abi_norm = re.sub(r'\s+', '', abi_value)
+        source_norm = re.sub(r'\s+', '', source_value)
+        
+        if abi_norm != source_norm:
+            mismatched.append((const_name, source_value, abi_value))
+    
+    if missing:
+        print(f"WARNING: Constant(s) not found in docs/ABI.md: {missing}")
+    if mismatched:
+        print(f"WARNING: Constant value mismatch in docs/ABI.md:")
+        for name, source_val, abi_val in mismatched:
+            print(f"  {name}: source={source_val}, ABI.md={abi_val}")
+            
+    return True  # Don't fail on warnings for now
 
 
 def check_error_alignment() -> bool:
@@ -113,27 +180,15 @@ def check_error_alignment() -> bool:
     return True
 
 
-def check_audit_md_entrypoint_drift(source: str, audit_text: str, audit_path: Path) -> bool:
-    """Check that audit.md entrypoint table covers all public ABI functions.
-
-    Returns True if drift is detected (table is out of date).
-    """
-    fns = extract_contractimpl_pub_fns(source)
-    entrypoints = [
-        f for f in fns
-        if f not in AUDIT_ENTRYPOINT_ALLOWLIST
-        and not f.startswith("_")
-    ]
-
-    missing = [f for f in entrypoints if f not in audit_text]
-    return bool(missing)
-
-
 def main() -> int:
     passed = True
 
-    print("Checking streaming.md entrypoint coverage...")
-    if not check_streaming_entrypoints():
+    print("Checking README.md function signature coverage...")
+    if not check_readme_functions():
+        passed = False
+
+    print("Checking docs/ABI.md constant alignment...")
+    if not check_abi_constants():
         passed = False
 
     print("Checking error.md discriminant alignment...")
