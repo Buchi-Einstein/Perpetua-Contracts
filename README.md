@@ -142,6 +142,10 @@ change. Before accepting a stream a recipient can verify that the sender cannot
 claw it back, freeze it, or reassign it. A stream that could *become* cancellable
 later would be worthless as a guarantee.
 
+This is enforced statically, not just by convention: `script/check-flag-immutability.py`
+and `test::immutability` (which compiles `lib.rs` into the test binary) fail the
+build if any function assigns to a flag post-creation (issue #104).
+
 For the same reason there is no admin key, no upgrade path, no fee switch and no
 global pause. Immutability is what lets another protocol depend on this one.
 
@@ -397,10 +401,12 @@ contracts/                        the deployable contracts (standalone Cargo pro
     src/events.rs                 event definitions
     src/types.rs                  Stream, StreamStatus, DataKey
     src/error.rs                  typed errors (discriminants are ABI)
-    src/test/                     36 modules, ~570 tests, staged by build order
+    src/test/                     37 modules, ~600 tests, staged by build order
   factory/                        policy gate (cap, duration, rate bounds, allowlist, pause)
   governance/                     timelocked multi-sig for factory policy
   archival-probe/                 throwaway archival/restore probe — never deploy
+
+sdk/react-hooks/                  reference React hooks (useStream, useAccruedBalance)
 
 script/                           release, provenance, sandbox, validation automation
 tools/provenance/                 release-integrity gate: SLSA-style wasm manifests
@@ -458,6 +464,8 @@ met**. A canary entry was planted on 2026-08-12; see
 `script/archival-canary.sh`.
 
 Then the indexer, keeper and TypeScript SDK (stage 5), reference UI last (stage 6).
+The reference React hooks for those UIs live in
+[`sdk/react-hooks/`](sdk/react-hooks/README.md) (issues #106).
 
 Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
@@ -466,6 +474,7 @@ Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.
 | | |
 |---|---|
 | [docs/ABI.md](docs/ABI.md) | **Interface of record.** Frozen 2026-08-12. Read this before integrating. |
+| [docs/griefing-analysis-extend-ttl.md](docs/griefing-analysis-extend-ttl.md) | Issue #97: formal audit of the permissionless TTL keeper surface. |
 | [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
 | [docs/soroban-rpc-read-skew.md](docs/soroban-rpc-read-skew.md) | Pin multi-call reads to one ledger, and the read-after-write barrier. |
