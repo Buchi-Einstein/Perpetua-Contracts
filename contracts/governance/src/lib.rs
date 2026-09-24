@@ -1545,6 +1545,91 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Cross-contract dispatch — governance driving factory policy (#38)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_governance_executes_factory_policy_update_cross_contract() {
+        use soroban_sdk::xdr::ToXdr;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        // Governance contract: 3 signers, threshold 2.
+        let gov_id = env.register(FluxoraGovernance, ());
+        let gov = FluxoraGovernanceClient::new(&env, &gov_id);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        gov.init(
+            &admin,
+            &vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+            &2u32,
+        );
+
+        // Factory contract whose admin is the governance contract.
+        let factory_id = env.register(fluxora_factory::FluxoraFactory, ());
+        let factory = fluxora_factory::FluxoraFactoryClient::new(&env, &factory_id);
+        let stream_contract = Address::generate(&env);
+        factory.init(&gov_id, &stream_contract, &10_000, &100);
+        assert_eq!(factory.get_factory_config().max_deposit, 10_000);
+
+        // Queue a governed `FactorySetCap(42)` proposal targeted at the factory
+        // and drive it through the full multi-sig lifecycle in the test host.
+        let calldata = CallData::FactorySetCap(42).to_xdr(&env);
+        let id = gov.propose(&signer_a, &factory_id, &calldata);
+        gov.approve(&signer_a, &id);
+        gov.approve(&signer_b, &id);
+
+        env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&env);
+        gov.execute(&executor, &id);
+
+        // The cross-contract dispatch reached the factory and applied the
+        // policy update; execution is recorded on the proposal.
+        assert_eq!(factory.get_factory_config().max_deposit, 42);
+        assert!(gov.get_proposal(&id).executed);
+    }
+
+    #[test]
+    fn test_governance_rotates_factory_admin_cross_contract() {
+        use soroban_sdk::xdr::ToXdr;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let gov_id = env.register(FluxoraGovernance, ());
+        let gov = FluxoraGovernanceClient::new(&env, &gov_id);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        gov.init(
+            &admin,
+            &vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+            &2u32,
+        );
+
+        let factory_id = env.register(fluxora_factory::FluxoraFactory, ());
+        let factory = fluxora_factory::FluxoraFactoryClient::new(&env, &factory_id);
+        let stream_contract = Address::generate(&env);
+        factory.init(&gov_id, &stream_contract, &10_000, &100);
+
+        // Governance rotates the factory admin via the generic dispatch path.
+        let new_admin = Address::generate(&env);
+        let calldata = CallData::FactorySetAdmin(new_admin.clone()).to_xdr(&env);
+        let id = gov.propose(&signer_a, &factory_id, &calldata);
+        gov.approve(&signer_a, &id);
+        gov.approve(&signer_b, &id);
+        env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&env);
+        gov.execute(&executor, &id);
+
+        assert_eq!(factory.get_factory_config().admin, new_admin);
+    }
+
     #[test]
     fn test_quorum_and_timelock_constants() {
         let ctx = Ctx::setup();
