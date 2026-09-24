@@ -829,6 +829,51 @@ fn delegated_address_cannot_act_on_a_stream_it_does_not_own() {
     h.assert_pool_exact();
 }
 
+/// #1637 hardens recipient-transfer authorization to the sender, and that
+/// holds for contract-typed (smart-account) signers too: the smart sender must
+/// authorize the transfer, and the new smart recipient must be able to withdraw
+/// afterwards.
+#[test]
+fn smart_account_sender_can_transfer_between_smart_recipients() {
+    let h = Harness::new();
+    let smart_sender = Address::generate(&h.env);
+    let smart_a = Address::generate(&h.env);
+    let smart_b = Address::generate(&h.env);
+    h.token_admin.mint(&smart_sender, &(1_000 * ONE));
+
+    let start = h.now();
+    let id = h.client.create_stream(
+        &smart_sender,
+        &smart_a,
+        &h.token,
+        &(500 * ONE),
+        &start,
+        &(start + 100 * DAY),
+        &start,
+        &true,
+        &true,
+        &true,
+    );
+    assert_eq!(required_auth(&h.env), smart_sender, "create auth");
+
+    h.client.transfer_recipient(&id, &smart_b);
+    assert_eq!(
+        required_auth(&h.env),
+        smart_sender,
+        "transfer is sender-gated even for smart signers"
+    );
+
+    h.advance(100 * DAY);
+    h.client.withdraw(&id, &None);
+    assert_eq!(
+        required_auth(&h.env),
+        smart_b,
+        "new smart recipient can withdraw"
+    );
+    assert_eq!(h.balance(&smart_b), 500 * ONE, "100% vested at end");
+    h.assert_pool_exact();
+}
+
 // ---------------------------------------------------------------------------
 // 13. Capability flags are enforced independently of authorization
 // ---------------------------------------------------------------------------
@@ -1090,7 +1135,7 @@ impl AuthAction {
     fn args(self, h: &Harness, stream_id: u64, stream: &Stream, caller: &Address) -> Vec<Val> {
         match self {
             AuthAction::Withdraw => (stream_id, None::<i128>).into_val(&h.env),
-            AuthAction::BatchWithdraw => (caller, h.ids(&[stream_id])).into_val(&h.env),
+            AuthAction::BatchWithdraw => (h.ids(&[stream_id]),).into_val(&h.env),
             AuthAction::TransferRecipient => {
                 (stream_id, self.transfer_target(h, stream)).into_val(&h.env)
             }
@@ -1254,4 +1299,123 @@ proptest! {
             h.assert_pool_exact();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 17. Spoofed signatures — a credential for the wrong party must fail
+// ---------------------------------------------------------------------------
+
+/// Issue #84: an attacker who holds *a* signature — even the stream's own
+/// recipient's — must not be able to unlock an entrypoint that belongs to
+/// someone else. The Soroban host compares the demanded address against the
+/// supplied credentials and refuses the call outright.
+fn assert_host_rejects_spoofed(h: &Harness, id: u64, action: AuthAction, forged: Address) {
+    let stream = h.get(id);
+    let before = snapshot(h, id, &Address::generate(&h.env));
+    let accepted = action.apply(h, id, &stream, &forged);
+    assert!(
+        !accepted,
+        "{} accepted a spoofed credential for {}",
+        action.fn_name(),
+        forged,
+    );
+    assert_eq!(
+        snapshot(h, id, &Address::generate(&h.env)),
+        before,
+        "{} mutated state under a spoofed credential",
+        action.fn_name(),
+    );
+    assert!(
+        h.env.events().all().events().is_empty(),
+        "{} emitted events under a spoofed credential",
+        action.fn_name(),
+    );
+}
+
+/// The recipient's own credential, forged against sender-gated entrypoints.
+#[test]
+fn spoofed_signature_is_rejected_for_every_sender_gated_entrypoint() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+
+    let forged = h.recipient.clone();
+    let via_forged = |action| {
+        assert_host_rejects_spoofed(&h, id, action, forged.clone());
+    };
+    via_forged(AuthAction::TopUp);
+    via_forged(AuthAction::Pause);
+    via_forged(AuthAction::Resume);
+    via_forged(AuthAction::Cancel);
+    via_forged(AuthAction::TransferRecipient); // sender-gated after #1637
+    h.assert_pool_exact();
+}
+
+/// The sender's own credential, forged against recipient-gated entrypoints.
+#[test]
+fn spoofed_signature_is_rejected_for_every_recipient_gated_entrypoint() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(30 * DAY);
+
+    let forged = h.sender.clone();
+    assert_host_rejects_spoofed(&h, id, AuthAction::Withdraw, forged.clone());
+    assert_host_rejects_spoofed(&h, id, AuthAction::BatchWithdraw, forged);
+    h.assert_pool_exact();
+}
+
+/// A spoofed `create_stream`: only the recipient's credential is on hand, but
+/// the stream is opened in the sender's name. The host refuses, no stream is
+/// created, and no tokens move.
+#[test]
+fn spoofed_signature_cannot_create_a_stream_for_someone_else() {
+    let h = Harness::new();
+
+    let start = h.now();
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "create_stream",
+        args: (
+            &h.sender,
+            &h.recipient,
+            &h.token,
+            &(100 * ONE),
+            &start,
+            &(start + 100 * DAY),
+            &start,
+            &true,
+            &true,
+            &true,
+        )
+            .into_val(&h.env),
+        sub_invokes: &[],
+    };
+    h.env.mock_auths(&[MockAuth {
+        address: &h.recipient,
+        invoke: &invoke,
+    }]);
+
+    assert!(
+        h.client
+            .try_create_stream(
+                &h.sender,
+                &h.recipient,
+                &h.token,
+                &(100 * ONE),
+                &start,
+                &(start + 100 * DAY),
+                &start,
+                &true,
+                &true,
+                &true,
+            )
+            .is_err(),
+        "host rejected the spoofed create",
+    );
+
+    assert_eq!(h.client.stream_count(), 0, "no stream created");
+    assert_eq!(h.pool(), 0, "no tokens moved");
+
+    h.env.mock_all_auths();
+    h.assert_pool_exact();
 }

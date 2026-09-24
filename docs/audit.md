@@ -5,6 +5,40 @@ The CI "Audit entrypoint drift check" step verifies this table against the sourc
 
 Last verified: 2026-08-29 (PR #1665)
 
+## Arithmetic audit (§98 — silent wrapping)
+
+There are no unchecked primitive operators on the value path. Every addition,
+subtraction, multiplication and division in `contracts/stream/src/accrual.rs`
+is either `checked_` (mapping failures to `Error::Overflow`), `saturating_`
+(clamping at the boundary) or guarded by a creation-time domain bound:
+
+| Op | Location | Behaviour |
+|---|---|---|
+| `frozen_at - paused_total` | `stream_time` | `saturating_sub`, clamps at zero |
+| `end_time - start_time` | `duration` | `saturating_sub` |
+| `clock - start_time` (capped) | `elapsed` | `saturating_sub` |
+| `deposited * consumed` | `vested` | `checked_mul` -> `Error::Overflow` |
+| `deposited / duration` | `vested` | `checked_div`, `duration == 0` short-circuit |
+| `earned - withdrawn` | `withdrawable` | `checked_sub`, saturates at zero |
+| `deposited - earned` | `refundable` | `checked_sub` |
+| `deposited - withdrawn` | `liability` | `checked_sub` |
+
+Backing guarantees:
+
+* **`overflow-checks = true`** in `contracts/stream/Cargo.toml`
+  (`[profile.release]`): even a missed `+`/`*`/`-` panics on overflow instead
+  of silently wrapping in the deployed WASM.
+* **Creation-time domain bound** (`create_stream`, lib.rs:255-271): a stream is
+  rejected unless `deposit * duration` fits in `i128`, so `deposited *
+  elapsed` inside `vested` can never overflow for a stream that reached
+  storage. `top_up` re-establishes the same bound post-extension.
+* **`u64 as i128` casts are lossless**, and `u64::MAX` fits comfortably in
+  `i128`, so no `as` cast on the value path can truncate.
+* **Typed, not trapped:** `test::accrual_overflow` (accrual_overflow.rs) drives
+  every helper at `u64::MAX` timestamps and `i128`-ceiling deposits and asserts
+  the result is `Ok(bounded)` or `Err(Error::Overflow)` — never a panic and
+  never a wrap.
+
 ## Stream Contract — `fluxora_stream`
 
 ### Lifecycle
@@ -51,3 +85,23 @@ Last verified: 2026-08-29 (PR #1665)
 |---|---|
 | `extend_stream_ttl` | Extend a single stream's storage TTL |
 | `batch_extend_ttl` | Extend multiple streams' storage TTLs |
+
+## Reentrancy Resistance
+
+All withdrawal and token-transfer paths follow the **Checks-Effects-Interactions**
+pattern. In `apply_withdrawal` (`src/lib.rs`):
+
+1. `stream.withdrawn` is updated and `stream.status` is possibly set to `Depleted`.
+2. `storage::save_stream` persists the updated stream state.
+3. `token_transfer` moves tokens to the recipient.
+
+State is written **before** the external token contract is called. Soroban's
+host forbids contract reentrancy by default, so even a malicious or buggy token
+contract cannot call back into `FluxoraStream` mid-transfer. If the token
+transfer fails (insufficient balance, deauthorized recipient, host trap), the
+Soroban host unwinds the entire transaction and no storage write is committed.
+
+This ordering is verified by `withdrawal_atomicity.rs`, which engineers two
+failure modes — SAC `set_authorized(recipient, false)` and an always-panicking
+token contract — and asserts that stream state and token balances are
+byte-for-byte identical before and after the failed call.

@@ -736,3 +736,109 @@ fn top_up_then_cancel_leaves_terminal_state() {
     );
     h.assert_pool_exact();
 }
+
+// ---------------------------------------------------------------------------
+// Issue #87 — invariant hold under rapid sequences of cancel/pause/withdraw
+// ---------------------------------------------------------------------------
+
+/// pause → cancel → withdraw: the cancel clears the pause state, the vested
+/// tail remains claimable exactly once, and once the claim is settled the
+/// stream is immutable — every further mutating call bounces with
+/// `StreamTerminated` and storage stays byte-identical.
+#[test]
+fn pause_then_cancel_then_withdraw_ends_immutable() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.advance(30 * DAY);
+    h.client.pause(&id);
+    h.advance(20 * DAY);
+    h.client.cancel(&id);
+
+    let s = h.get(id);
+    assert_eq!(s.status, StreamStatus::Cancelled);
+    assert_eq!(s.paused_at, None, "pause state cleared by cancel");
+
+    let tail = h.client.withdrawable_of(&id);
+    assert!(tail > 0, "vested tail remains claimable after cancel");
+    assert_eq!(h.client.withdraw(&id, &None), tail);
+    assert_eq!(h.get(id).withdrawn, h.get(id).deposited, "claim settled");
+
+    let before = h.get(id);
+    let pool_before = h.pool();
+
+    let operations = [
+        (
+            "pause",
+            h.client
+                .try_pause(&id)
+                .map(|r| r.map(|_| ()).map_err(|_| ())),
+        ),
+        (
+            "resume",
+            h.client
+                .try_resume(&id)
+                .map(|r| r.map(|_| ()).map_err(|_| ())),
+        ),
+        (
+            "top_up",
+            h.client
+                .try_top_up(&id, &(10 * ONE))
+                .map(|r| r.map(|_| ()).map_err(|_| ())),
+        ),
+        (
+            "cancel",
+            h.client
+                .try_cancel(&id)
+                .map(|r| r.map(|_| ()).map_err(|_| ())),
+        ),
+        (
+            "withdraw",
+            h.client
+                .try_withdraw(&id, &None)
+                .map(|r| r.map(|_| ()).map_err(|_| ())),
+        ),
+    ];
+
+    for (op, result) in operations {
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::StreamTerminated,
+            "settled-and-cancelled → {op}"
+        );
+    }
+
+    assert_eq!(h.get(id), before, "state unchanged after rejections");
+    assert_eq!(h.pool(), pool_before, "pool unchanged");
+    h.assert_pool_exact();
+}
+
+/// withdraw → pause → resume → withdraw: pausing between draws must not corrupt
+/// the accounting. The sum of all draws equals the total vested, nothing is
+/// stranded, and the pool exactly matches the residual liability throughout.
+#[test]
+fn withdraw_then_pause_resume_then_withdraw_keeps_accounting_consistent() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    h.advance(25 * DAY);
+    let first = h.client.withdraw(&id, &None);
+    assert_eq!(first, 250 * ONE);
+    h.assert_pool_exact();
+
+    h.client.pause(&id);
+    h.advance(10 * DAY);
+    h.client.resume(&id);
+    h.assert_pool_exact();
+
+    h.advance(25 * DAY);
+    let second = h.client.withdraw(&id, &None);
+
+    assert_eq!(h.get(id).withdrawn, first + second);
+    assert_eq!(
+        h.get(id).withdrawn,
+        h.client.vested_of(&id),
+        "all vested value drawn, none stranded",
+    );
+    h.assert_pool_exact();
+}

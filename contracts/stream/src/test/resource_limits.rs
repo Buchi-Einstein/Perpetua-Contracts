@@ -259,10 +259,10 @@ fn batch_ttl_cost_grows_linearly_and_not_faster() {
     }
 }
 
-/// The contract holds no per-user index, so a treasury's hundredth stream costs
-/// exactly what its first did. This is the property the "no on-chain discovery"
-/// decision buys, stated as a test — and it is precisely what the existing
-/// implementations get wrong.
+/// The contract holds no per-user index, so a treasury's thousandth stream
+/// costs exactly what its first did. This is the property the "no on-chain
+/// discovery" decision buys, stated as a test — and it is precisely what the
+/// existing implementations get wrong.
 #[test]
 fn cost_is_independent_of_how_many_streams_exist() {
     let h = Harness::new();
@@ -275,11 +275,11 @@ fn cost_is_independent_of_how_many_streams_exist() {
     let early_id = h.create_simple(100 * ONE, 100 * DAY);
     let early_create = report(&h, "create #2");
 
-    for _ in 0..150 {
+    for _ in 0..1000 {
         h.create_simple(10 * ONE, 100 * DAY);
     }
     let late_id = h.create_simple(100 * ONE, 100 * DAY);
-    let late_create = report(&h, "create #153");
+    let late_create = report(&h, "create #1003");
 
     assert_eq!(
         early_create.footprint, late_create.footprint,
@@ -298,7 +298,7 @@ fn cost_is_independent_of_how_many_streams_exist() {
     h.client.withdraw(&early_id, &None);
     let early = report(&h, "withdraw from #2");
     h.client.withdraw(&late_id, &None);
-    let late = report(&h, "withdraw from #153");
+    let late = report(&h, "withdraw from #1003");
 
     assert_eq!(
         early.footprint, late.footprint,

@@ -198,6 +198,11 @@ No third-party security audit has been performed. The property tests, the pool
 invariant and the randomized sequence suite are evidence of care, not a
 substitute for review.
 
+Audit scope, the reporting process and the bug-bounty rules are defined in
+`docs/SECURITY.md` (§101). Re-confirm this section's status before any
+mainnet launch announcement: it stays open until the first review is
+published.
+
 ---
 
 ## 5. Ledger close time is assumed, not measured

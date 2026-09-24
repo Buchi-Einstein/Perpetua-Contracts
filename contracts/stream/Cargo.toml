@@ -31,24 +31,35 @@ doctest = false
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = "27.0.5"
+soroban-sdk = "27.0.6"
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.5", features = ["testutils"] }
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }
 proptest = "1"
 # Used by the packaging tests to parse `cargo metadata` JSON output.
 # Only a dev-dependency; never compiled into the contract WASM.
 serde_json = { version = "1.0.140", default-features = false, features = ["std"] }
 
+# Issue #117 — WASM size reduction below 40 KiB.
+# Every knob below exists to shrink the compiled stream wasm:
+#   opt-level "z"      -> optimize for size, not speed
+#   lto "fat"          -> whole-crate inlining across codegen units
+#   codegen-units 1    -> single unit so LTO has the full picture
+#   panic "abort"      -> no unwinding tables in the wasm
+#   strip "symbols"    -> drop name section / debug symbols
+#   debug 0            -> no debuginfo
+# Size is enforced on CI by script/check-stream-wasm-size.sh against
+# wasm-size-budget.env (target 40 KiB). Do not regress it.
 [profile.release]
 opt-level = "z"
-overflow-checks = true
-debug = 0
-strip = "symbols"
-debug-assertions = false
-panic = "abort"
+lto = "fat"
 codegen-units = 1
-lto = true
+panic = "abort"
+strip = "symbols"
+debug = 0
+debug-assertions = false
+overflow-checks = true
+incremental = false
 
 [profile.release-with-logs]
 inherits = "release"

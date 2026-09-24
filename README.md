@@ -18,7 +18,7 @@ project exists to build, verify and release it with integrity.
 | SDK | `soroban-sdk` 27.0.5 |
 | Rust | 1.97.1, target `wasm32v1-none` |
 | Token interface | SEP-41 (USDC on Stellar has **7 decimals**) |
-| Product contract size | ~47 KiB baseline; enforced by `contracts/stream/wasm-size-budget.env` |
+| Product contract size | sub-40 KiB target; enforced by `contracts/stream/wasm-size-budget.env` |
 | Tests | ~700 across four contract crates (unit, property and integration) |
 
 > **Read [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) before relying on this.**
@@ -62,8 +62,11 @@ through a shared build artifact.
 
 # Deeper randomized sweep. CI runs this nightly; worth running before a release
 # or after touching accrual.rs. Both suites have found real bugs.
-FLUXORA_FUZZ_SEEDS=200 FLUXORA_FUZZ_STEPS=300 PROPTEST_CASES=5000 \
+FLUXORA_FUZZ_SEEDS=500 FLUXORA_FUZZ_STEPS=1000 PROPTEST_CASES=5000 \
   (cd contracts/stream && cargo test --release)
+
+# Local end-to-end testing with standalone Soroban network:
+script/local-sandbox-proof.sh
 ```
 
 ## Building and releasing
@@ -101,6 +104,17 @@ script/provenance.sh build   # wasm build + generate + verify (the release gate)
 script/provenance.sh verify  # re-check the current build
 ```
 
+### WASM checksum verification
+
+To verify that a locally built WASM matches the official released binary bytes:
+
+```bash
+script/verify-wasm-checksum.sh        # builds and verifies
+script/verify-wasm-checksum.sh --no-build  # verifies existing build
+```
+
+Output shows green status for success, red for failure.
+
 ## Design
 
 ### Pull-based, because Stellar has no scheduler
@@ -130,6 +144,10 @@ this as a test: the 153rd stream costs exactly what the 2nd did.
 change. Before accepting a stream a recipient can verify that the sender cannot
 claw it back, freeze it, or reassign it. A stream that could *become* cancellable
 later would be worthless as a guarantee.
+
+This is enforced statically, not just by convention: `script/check-flag-immutability.py`
+and `test::immutability` (which compiles `lib.rs` into the test binary) fail the
+build if any function assigns to a flag post-creation (issue #104).
 
 For the same reason there is no admin key, no upgrade path, no fee switch and no
 global pause. Immutability is what lets another protocol depend on this one.
@@ -386,14 +404,18 @@ contracts/                        the deployable contracts (standalone Cargo pro
     src/events.rs                 event definitions
     src/types.rs                  Stream, StreamStatus, DataKey
     src/error.rs                  typed errors (discriminants are ABI)
-    src/test/                     36 modules, ~570 tests, staged by build order
+    src/test/                     37 modules, ~600 tests, staged by build order
   factory/                        policy gate (cap, duration, rate bounds, allowlist, pause)
   governance/                     timelocked multi-sig for factory policy
   archival-probe/                 throwaway archival/restore probe — never deploy
+apps/demo/                        reference Next.js + Tailwind payroll dashboard (stage 6)
+
+sdk/react-hooks/                  reference React hooks (useStream, useAccruedBalance)
 
 script/                           release, provenance, sandbox, validation automation
 tools/provenance/                 release-integrity gate: SLSA-style wasm manifests
 tests/                            validator test suite (pytest)
+sdk/                              off-chain stream math mirror (JS/BigInt)
 docs/                             ABI, limitations, migration and design documents
 ```
 
@@ -447,6 +469,8 @@ met**. A canary entry was planted on 2026-08-12; see
 `script/archival-canary.sh`.
 
 Then the indexer, keeper and TypeScript SDK (stage 5), reference UI last (stage 6).
+The reference React hooks for those UIs live in
+[`sdk/react-hooks/`](sdk/react-hooks/README.md) (issues #106).
 
 Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.md).
 
@@ -455,10 +479,14 @@ Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.
 | | |
 |---|---|
 | [docs/ABI.md](docs/ABI.md) | **Interface of record.** Frozen 2026-08-12. Read this before integrating. |
+| [docs/griefing-analysis-extend-ttl.md](docs/griefing-analysis-extend-ttl.md) | Issue #97: formal audit of the permissionless TTL keeper surface. |
 | [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
+| [docs/URI-SCHEME.md](docs/URI-SCHEME.md) | `stellar:stream` URI / QR-code standard for sharing a stream. |
 | [docs/soroban-rpc-read-skew.md](docs/soroban-rpc-read-skew.md) | Pin multi-call reads to one ledger, and the read-after-write barrier. |
 | [docs/provenance.md](docs/provenance.md) | Wasm provenance schema, design decisions, and the release gate. |
+| [docs/dust-theft-proof.md](docs/dust-theft-proof.md) | Why micro-top-ups cannot erode the pool or steal residue (§102). |
+| [docs/SECURITY.md](docs/SECURITY.md) | Audit scope, reporting process and bug bounty rules (§101). |
 | [fluxora-build-spec.md](fluxora-build-spec.md) | The build spec, with amendments where measurement contradicted it. |
 
 > **Note for deployment:** the `stellar` CLI must be at least version 27 to match

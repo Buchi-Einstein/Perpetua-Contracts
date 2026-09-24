@@ -893,6 +893,113 @@ fn a_batch_rejected_for_duplicates_can_be_retried_without_them() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #96 — Griefing via malformed stream lists
+// ---------------------------------------------------------------------------
+
+/// The described attack is a *mixed* malformed list: duplicates and
+/// non-existent ids together. Whichever structural check fires first, the
+/// call must return a typed error, move no tokens, and emit no events — a
+/// green box for "grief me" inputs, not a gas-burning probe.
+#[test]
+fn a_batch_with_duplicates_and_missing_ids_is_rejected_deterministically() {
+    for ids in [[0, 1, 999, 1], [1, 999, 999, 0], [999, 0, 1, 0]] {
+        let h = Harness::new();
+        let a = h.create_simple(100 * ONE, 100 * DAY);
+        let b = h.create_simple(100 * ONE, 100 * DAY);
+        h.advance(30 * DAY);
+
+        let sender_before = h.balance(&h.sender);
+        let recipient_before = h.balance(&h.recipient);
+        let pool_before = h.pool();
+
+        let err = h
+            .client
+            .try_batch_withdraw(&h.recipient, &h.ids(&ids))
+            .unwrap_err()
+            .unwrap();
+
+        assert!(
+            matches!(err, Error::DuplicateStreamId | Error::StreamNotFound),
+            "ids {ids:?}: got {err:?}"
+        );
+        assert!(
+            withdrawn_event_ids(&h).is_empty(),
+            "griefing batch leaked events for ids {ids:?}"
+        );
+        assert_eq!(h.balance(&h.sender), sender_before);
+        assert_eq!(h.balance(&h.recipient), recipient_before);
+        assert_eq!(h.pool(), pool_before);
+        for id in [a, b] {
+            assert_eq!(h.get(id).withdrawn, 0, "stream {id} drawn for ids {ids:?}");
+        }
+        h.assert_pool_exact();
+
+        // The same malformed list must fail identically on retry — the
+        // contract keeps no state from a rejected batch.
+        let again = h
+            .client
+            .try_batch_withdraw(&h.recipient, &h.ids(&ids))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, again, "ids {ids:?}: retry diverged");
+    }
+}
+
+/// Structural rejection happens *before* any stream is resolved and *before*
+/// the recipient authorizes anything. A griefing caller who weaves a duplicate
+/// into a list of hot ids cannot make the batch burn gas on storage reads or
+/// trick the contract into touching a stream it should not.
+#[test]
+fn duplicate_rejection_precedes_resolution_and_authorization() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+    let b = h.create_simple(100 * ONE, 100 * DAY);
+    h.advance(30 * DAY);
+    h.env.mock_auths(&[]);
+
+    let err = h
+        .client
+        .try_batch_withdraw(&h.recipient, &h.ids(&[a, b, a]))
+        .unwrap_err()
+        .unwrap();
+
+    assert_eq!(err, Error::DuplicateStreamId);
+    assert!(
+        h.env.auths().is_empty(),
+        "recipient auth must not be solicited for a structurally invalid batch"
+    );
+    h.env.mock_all_auths();
+    h.assert_pool_exact();
+}
+
+/// The TTL sweep is the permissionless half of the surface, so it is the more
+/// attractive griefing target of the two. Duplicates must be rejected wherever
+/// they sit, wholesale, with no partial rent paid on the way out.
+#[test]
+fn a_ttl_batch_duplicate_is_rejected_at_any_position() {
+    for ids in [[0, 0, 1], [0, 1, 0], [1, 0, 0], [0, 1, 1]] {
+        let h = Harness::new();
+        h.env.ledger().set_max_entry_ttl(50_000);
+        let a = h.create_simple(100 * ONE, YEAR);
+        let b = h.create_simple(100 * ONE, YEAR);
+        age_ledgers(&h, 40_000);
+        let before_a = ttl_of(&h, a);
+        let before_b = ttl_of(&h, b);
+
+        let err = h
+            .client
+            .try_batch_extend_ttl(&h.ids(&ids))
+            .unwrap_err()
+            .unwrap();
+
+        assert_eq!(err, Error::DuplicateStreamId, "ids {ids:?}");
+        assert_eq!(ttl_of(&h, a), before_a, "ids {ids:?}: a was extended");
+        assert_eq!(ttl_of(&h, b), before_b, "ids {ids:?}: b was extended");
+        assert!(h.env.auths().is_empty(), "ids {ids:?}: auth solicited");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Ordering
 // ---------------------------------------------------------------------------
 
