@@ -119,7 +119,11 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 11 | `StreamNotActive` | | 24 | `StreamIdExhausted` |
 | 12 | `StreamNotPaused` | | 25 | `TokenTransferFailed` |
 | 13 | `StreamAlreadyPaused` | | 26 | `TokenMissing` |
+| | | | 27 | `DelegateNotPermitted` |
+| | | | 28 | `DelegateExpired` |
 | | | | 29 | `MalformedStreamId` |
+| | | | 30 | `RepeatedTransfer` |
+| | | | 31 | `InvalidTopUp` |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
