@@ -135,7 +135,10 @@ pub fn seconds_to_ledgers(seconds: u64) -> u32 {
 /// keeper path exists for.
 pub fn ttl_target_ledgers(env: &Env, stream: &Stream) -> u32 {
     let now = env.ledger().timestamp();
+    ttl_target_ledgers_at(env, stream, now)
+}
 
+pub fn ttl_target_ledgers_at(env: &Env, stream: &Stream, now: u64) -> u32 {
     // A paused stream's end date slides forward in wall-clock terms, so include
     // the accumulated pause when working out how much longer it may run.
     let effective_end = stream
