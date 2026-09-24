@@ -18,7 +18,8 @@
 //! respect caps and minimums pins this contract in front of stream creation.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
+    Symbol,
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +68,10 @@ pub struct FactoryConfig {
     pub min_rate_per_second: Option<i128>,
     /// Optional upper bound on the per-second stream rate, applied at creation.
     pub max_rate_per_second: Option<i128>,
+    /// Maximum number of non-terminal streams admitted through this factory.
+    pub max_active_streams: u32,
+    /// Number of streams admitted but not yet released by a terminal callback.
+    pub active_streams: u32,
 }
 
 /// The policy view consumed by the stream-creation paths.
@@ -85,6 +90,8 @@ pub struct FactoryPolicy {
     pub creation_paused: bool,
     pub min_rate_per_second: Option<i128>,
     pub max_rate_per_second: Option<i128>,
+    pub max_active_streams: u32,
+    pub active_streams: u32,
 }
 
 /// Error codes for the factory contract.
@@ -100,6 +107,10 @@ pub enum FactoryError {
     Unauthorized = 3,
     /// The recipient is not allowlisted.
     AllowlistDenied = 4,
+    /// The configured active-stream capacity has been reached.
+    CapacityCapExceeded = 5,
+    /// A terminal callback cannot reduce an empty active-stream count.
+    ActiveStreamCountUnderflow = 6,
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +148,8 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
         creation_paused: config.creation_paused,
         min_rate_per_second: config.min_rate_per_second,
         max_rate_per_second: config.max_rate_per_second,
+        max_active_streams: config.max_active_streams,
+        active_streams: config.active_streams,
     })
 }
 
@@ -183,6 +196,8 @@ impl FluxoraFactory {
             creation_paused: false,
             min_rate_per_second: None,
             max_rate_per_second: None,
+            max_active_streams: u32::MAX,
+            active_streams: 0,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
@@ -320,6 +335,81 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.min_rate_per_second = min_rate_per_second;
         config.max_rate_per_second = max_rate_per_second;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Update the maximum number of active streams admitted through the factory.
+    pub fn set_max_active_streams(env: Env, max_active_streams: u32) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        config.max_active_streams = max_active_streams;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Admit a stream through the configured stream contract.
+    ///
+    /// The counter is reserved before the cross-contract call and committed
+    /// only after it succeeds, so a failed stream creation cannot consume
+    /// capacity. The configured stream contract remains responsible for its
+    /// own validation and authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, FactoryError> {
+        let mut config = load_config(&env)?;
+        if config.active_streams >= config.max_active_streams {
+            return Err(FactoryError::CapacityCapExceeded);
+        }
+
+        let stream_id = env.invoke_contract::<u64>(
+            &config.stream_contract,
+            &Symbol::new(&env, "create_stream"),
+            (
+                sender,
+                recipient,
+                token,
+                deposit,
+                start_time,
+                end_time,
+                cliff_time,
+                cancellable,
+                pausable,
+                transferable,
+            )
+                .into_val(&env),
+        );
+
+        config.active_streams += 1;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(stream_id)
+    }
+
+    /// Release one active slot after a stream reaches a terminal state.
+    ///
+    /// Only the configured stream contract may call this callback. The stream
+    /// contract integration should invoke it exactly once for cancellation or
+    /// depletion; duplicate callbacks are rejected rather than underflowing.
+    pub fn stream_terminated(env: Env, _stream_id: u64) -> Result<(), FactoryError> {
+        let mut config = load_config(&env)?;
+        config.stream_contract.require_auth();
+        if config.active_streams == 0 {
+            return Err(FactoryError::ActiveStreamCountUnderflow);
+        }
+        config.active_streams -= 1;
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())

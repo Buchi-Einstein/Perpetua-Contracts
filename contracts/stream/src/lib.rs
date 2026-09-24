@@ -806,7 +806,7 @@ impl FluxoraStream {
         let mut transferred = 0u32;
         for (stream_id, stream) in validated.iter() {
             let mut stream = stream.clone();
-            if !stream.transferable {
+            if !stream.transferable() {
                 return Err(Error::NotTransferable);
             }
             if stream.status == StreamStatus::Depleted || stream.withdrawn >= stream.deposited {

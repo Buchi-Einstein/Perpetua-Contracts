@@ -6,7 +6,11 @@
   "scripts": {
     "test": "vitest run"
   },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.0.0"
+  },
   "devDependencies": {
+    "@types/node": "^22.10.2",
     "vitest": "^2.0.0"
   }
 }
