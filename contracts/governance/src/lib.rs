@@ -61,6 +61,8 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
+    /// Earliest ledger timestamp at which this proposal may execute; zero until quorum.
+    pub eta: u64,
     /// True once `execute` has been called successfully.
     pub executed: bool,
     /// True once `cancel_proposal` has been called. Terminal — no further
@@ -89,6 +91,8 @@ pub enum GovernanceError {
     QuorumNotReached = 7,
     /// Timelock period has not elapsed since quorum was first reached.
     TimelockNotElapsed = 8,
+    /// Proposal execution was attempted before its stored eta timestamp.
+    TimelockNotMet = 21,
     /// Signer has already approved this proposal.
     AlreadyApproved = 9,
     /// Calldata exceeds MAX_CALLDATA_BYTES.
@@ -834,6 +838,7 @@ impl FluxoraGovernance {
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
             created_at: now,
+            eta: 0,
             executed: false,
             cancelled: false,
         };
@@ -907,6 +912,7 @@ impl FluxoraGovernance {
         let quorum_reached = if approval_count == threshold {
             let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
+            proposal.eta = executable_after;
             Some((now, executable_after))
         } else {
             None
@@ -974,8 +980,7 @@ impl FluxoraGovernance {
     /// - `ProposalNotFound`: No proposal with this ID.
     /// - `AlreadyExecuted`: Proposal already executed.
     /// - `QuorumNotReached`: Approval count < threshold.
-    /// - `TimelockNotElapsed`: Less than `GOVERNANCE_TIMELOCK_SECONDS` have passed
-    ///   since quorum was reached.
+    /// - `TimelockNotMet`: The current ledger timestamp is before the proposal eta.
     /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot be represented.
     pub fn execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         executor.require_auth();
@@ -1012,7 +1017,12 @@ impl FluxoraGovernance {
         let now = env.ledger().timestamp();
         let exec_after = Self::executable_after(&quorum_info)?;
         if now < exec_after {
-            return Err(GovernanceError::TimelockNotElapsed);
+            return Err(GovernanceError::TimelockNotMet);
+        }
+
+        // Verify the proposal-level eta before dispatching the target call.
+        if env.ledger().timestamp() < proposal.eta {
+            return Err(GovernanceError::TimelockNotMet);
         }
 
         // CEI: mark as executed before emitting the event.
@@ -1100,6 +1110,11 @@ impl FluxoraGovernance {
     /// Read a proposal by ID.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernanceError> {
         load_proposal(&env, proposal_id)
+    }
+
+    /// Return the proposal-level execution timestamp (`eta`).
+    pub fn get_proposal_eta(env: Env, proposal_id: u32) -> Result<u64, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.eta)
     }
 
     /// Return the number of proposals created so far.
@@ -1240,7 +1255,7 @@ impl FluxoraGovernance {
 
         let now = env.ledger().timestamp();
         let exec_after = Self::executable_after(&quorum_info)?;
-        if now < exec_after {
+        if now < exec_after || now < proposal.eta {
             return Ok(false);
         }
 
@@ -2068,6 +2083,32 @@ mod tests {
         assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
     }
 
+    #[test]
+    fn test_execute_respects_proposal_eta_boundary() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("eta"));
+        assert_eq!(ctx.client.get_proposal_eta(&id), 0);
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        let eta = 1_000_000 + TIMELOCK;
+        assert_eq!(ctx.client.get_proposal_eta(&id), eta);
+
+        ctx.env.ledger().set_timestamp(eta - 1);
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::TimelockNotMet))
+        );
+        assert!(!ctx.client.get_proposal(&id).executed);
+
+        ctx.env.ledger().set_timestamp(eta);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+
+
     // -----------------------------------------------------------------------
     // Full happy path (regression)
     // -----------------------------------------------------------------------
@@ -2090,7 +2131,8 @@ mod tests {
 
         let executor = Address::generate(&ctx.env);
         let early = ctx.client.try_execute(&executor, &id);
-        assert_eq!(early, Err(Ok(GovernanceError::TimelockNotElapsed)));
+        assert_eq!(ctx.client.get_proposal_eta(&id), 1_000_000 + TIMELOCK);
+        assert_eq!(early, Err(Ok(GovernanceError::TimelockNotMet)));
 
         ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
         ctx.client.execute(&executor, &id);
@@ -2845,7 +2887,7 @@ mod tests {
         assert!(!ctx.client.is_executable(&id));
         assert_eq!(
             ctx.client.try_execute(&executor, &id),
-            Err(Ok(GovernanceError::TimelockNotElapsed))
+            Err(Ok(GovernanceError::TimelockNotMet))
         );
 
         // --- Post-timelock, executable ---
