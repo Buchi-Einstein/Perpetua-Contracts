@@ -1090,7 +1090,7 @@ impl AuthAction {
     fn args(self, h: &Harness, stream_id: u64, stream: &Stream, caller: &Address) -> Vec<Val> {
         match self {
             AuthAction::Withdraw => (stream_id, None::<i128>).into_val(&h.env),
-            AuthAction::BatchWithdraw => (caller, h.ids(&[stream_id])).into_val(&h.env),
+            AuthAction::BatchWithdraw => (h.ids(&[stream_id]),).into_val(&h.env),
             AuthAction::TransferRecipient => {
                 (stream_id, self.transfer_target(h, stream)).into_val(&h.env)
             }
@@ -1254,4 +1254,257 @@ proptest! {
             h.assert_pool_exact();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 17. Wrong keypair: non-recipient cannot withdraw
+// ---------------------------------------------------------------------------
+
+/// A non-recipient cannot withdraw even under full mock auth. The contract
+/// independently checks `stream.recipient == caller` after auth, so the
+/// wrong keypair is rejected at the auth layer before any state changes.
+#[test]
+fn non_recipient_cannot_withdraw() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+
+    let withdrawn_before = h.get(id).withdrawn;
+    let balance_before = h.balance(&h.recipient);
+    let pool_before = h.pool();
+
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "withdraw",
+        args: (id, None::<i128>).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.other,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    let err = client.try_withdraw(&id, &None).unwrap_err().unwrap();
+    assert_eq!(err, Error::Unauthorized, "non-recipient rejected");
+
+    assert_eq!(h.get(id).withdrawn, withdrawn_before);
+    assert_eq!(h.balance(&h.recipient), balance_before);
+    assert_eq!(h.pool(), pool_before);
+    h.assert_pool_exact();
+}
+
+/// A non-sender cannot transfer_recipient even under full mock auth.
+#[test]
+fn non_sender_cannot_transfer_recipient() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let recipient_before = h.get(id).recipient.clone();
+    let pool_before = h.pool();
+
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "transfer_recipient",
+        args: (id, h.other.clone()).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.other,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    let err = client
+        .try_transfer_recipient(&id, &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized, "non-sender rejected");
+
+    assert_eq!(h.get(id).recipient, recipient_before);
+    assert_eq!(h.pool(), pool_before);
+    h.assert_pool_exact();
+}
+
+// ---------------------------------------------------------------------------
+// 18. Signature scoping: args must match exactly
+// ---------------------------------------------------------------------------
+
+/// A signature scoped to stream_id=42 cannot be replayed on stream_id=99.
+#[test]
+fn withdraw_signature_scoped_to_stream_id() {
+    let h = Harness::new();
+    let id_a = h.create_simple(1_000 * ONE, 100 * DAY);
+    let id_b = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+
+    // Build auth for stream_id=id_a.
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "withdraw",
+        args: (id_a, None::<i128>).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.recipient,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    // Replay on stream_id=id_b: auth args do not match, must fail.
+    let err = client.try_withdraw(&id_b, &None).unwrap_err().unwrap();
+    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong stream_id");
+
+    h.assert_pool_exact();
+}
+
+/// A signature scoped to `amount=None` cannot be replayed with an explicit amount.
+#[test]
+fn withdraw_signature_scoped_to_amount() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+    h.advance(60 * DAY);
+
+    let partial = 300 * ONE;
+
+    // Build auth for `amount=None`.
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "withdraw",
+        args: (id, None::<i128>).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.recipient,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    // Replay with explicit amount: auth args do not match, must fail.
+    let err = client
+        .try_withdraw(&id, &Some(partial))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong amount");
+
+    h.assert_pool_exact();
+}
+
+/// A signature scoped to a specific set of stream_ids cannot be replayed on a
+/// different set in `batch_withdraw`.
+#[test]
+fn batch_withdraw_signature_scoped_to_stream_ids() {
+    let h = Harness::new();
+    let id_a = h.create_simple(100 * ONE, 100 * DAY);
+    let id_b = h.create_simple(100 * ONE, 100 * DAY);
+    let id_c = h.create_simple(100 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+
+    // Build auth for ids [id_a, id_b].
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "batch_withdraw",
+        args: (h.ids(&[id_a, id_b]),).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.recipient,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    // Replay on ids [id_a, id_c]: auth args do not match, must fail.
+    let err = client
+        .try_batch_withdraw(&h.recipient, &h.ids(&[id_a, id_c]))
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong batch ids");
+
+    h.assert_pool_exact();
+}
+
+/// A signature scoped to `new_recipient=X` cannot be replayed with a different
+/// recipient in `transfer_recipient`.
+#[test]
+fn transfer_recipient_signature_scoped_to_new_recipient() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    // Build auth scoped to new_recipient=h.recipient (which would be a no-op).
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "transfer_recipient",
+        args: (id, h.recipient.clone()).into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.sender,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    // Replay with new_recipient=h.other: auth args do not match, must fail.
+    let err = client
+        .try_transfer_recipient(&id, &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on wrong new_recipient");
+
+    assert_eq!(h.get(id).recipient, h.recipient, "recipient unchanged");
+    h.assert_pool_exact();
+}
+
+/// A signature scoped to one set of `create_stream` args cannot be replayed
+/// with different schedule or capability flags.
+#[test]
+fn create_stream_signature_scoped_to_args() {
+    let h = Harness::new();
+    let start = h.now();
+
+    // Build auth for specific create_stream args.
+    let invoke = MockAuthInvoke {
+        contract: &h.contract_id,
+        fn_name: "create_stream",
+        args: (
+            h.sender.clone(),
+            h.recipient.clone(),
+            h.token.clone(),
+            1_000 * ONE,
+            start,
+            start + 100 * DAY,
+            start,
+            true,
+            true,
+            true,
+        )
+            .into_val(&h.env),
+        sub_invokes: &[],
+    };
+    let auth = MockAuth {
+        address: &h.sender,
+        invoke: &invoke,
+    };
+    let client = h.client.mock_auths(&[auth]);
+
+    // Replay with a different deposit: auth args do not match, must fail.
+    let err = client
+        .try_create_stream(
+            &h.sender,
+            &h.recipient,
+            &h.token,
+            &(500 * ONE),
+            &start,
+            &(start + 100 * DAY),
+            &start,
+            &true,
+            &true,
+            &true,
+        )
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized, "scoped signature rejected on different create_stream args");
+
+    // No stream was created.
+    assert_eq!(h.client.stream_count(), 0);
+    h.assert_pool_exact();
 }

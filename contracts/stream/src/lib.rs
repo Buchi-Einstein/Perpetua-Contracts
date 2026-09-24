@@ -237,7 +237,10 @@ impl FluxoraStream {
         pausable: bool,
         transferable: bool,
     ) -> Result<u64, Error> {
-        sender.require_auth();
+        sender.require_auth_for_args(
+            (recipient.clone(), token.clone(), deposit, start_time, end_time, cliff_time, cancellable, pausable, transferable)
+                .into_val(&env),
+        );
 
         if sender == recipient {
             return Err(Error::SelfStream);
@@ -354,7 +357,7 @@ impl FluxoraStream {
     /// * [`Error::StreamTerminated`] — stream is cancelled or depleted.
     pub fn top_up(env: Env, stream_id: u64, amount: i128) -> Result<(), Error> {
         let mut stream = storage::load_stream(&env, stream_id)?;
-        stream.sender.require_auth();
+        stream.sender.require_auth_for_args((stream_id, amount).into_val(&env));
 
         if stream.status.is_terminal() {
             return Err(Error::StreamTerminated);
@@ -452,7 +455,7 @@ impl FluxoraStream {
     ///   withdrawable balance.
     pub fn withdraw(env: Env, stream_id: u64, amount: Option<i128>) -> Result<i128, Error> {
         let mut stream = storage::load_stream(&env, stream_id)?;
-        stream.recipient.require_auth();
+        stream.recipient.require_auth_for_args((stream_id, amount).into_val(&env));
 
         let now = env.ledger().timestamp();
         let available = accrual::withdrawable(&stream, now)?;
@@ -519,7 +522,7 @@ impl FluxoraStream {
     ) -> Result<i128, Error> {
         let stream_ids = Self::validate_batch_ids(&env, &stream_ids)?;
         Self::reject_duplicate_ids(&stream_ids)?;
-        recipient.require_auth();
+        recipient.require_auth_for_args((stream_ids.clone(),).into_val(&env));
 
         let now = env.ledger().timestamp();
         let mut streams = Vec::new(&env);
@@ -579,7 +582,7 @@ impl FluxoraStream {
     /// * [`Error::StreamTerminated`] — already cancelled or depleted.
     pub fn cancel(env: Env, stream_id: u64) -> Result<(), Error> {
         let mut stream = storage::load_stream(&env, stream_id)?;
-        stream.sender.require_auth();
+        stream.sender.require_auth_for_args((stream_id,).into_val(&env));
 
         if !stream.cancellable {
             return Err(Error::NotCancellable);
@@ -654,7 +657,7 @@ impl FluxoraStream {
     /// already earned.
     pub fn pause(env: Env, stream_id: u64) -> Result<(), Error> {
         let mut stream = storage::load_stream(&env, stream_id)?;
-        stream.sender.require_auth();
+        stream.sender.require_auth_for_args((stream_id,).into_val(&env));
 
         if !stream.pausable {
             return Err(Error::NotPausable);
@@ -679,7 +682,7 @@ impl FluxoraStream {
     /// `paused_total` so the clock picks up exactly where it stopped.
     pub fn resume(env: Env, stream_id: u64) -> Result<(), Error> {
         let mut stream = storage::load_stream(&env, stream_id)?;
-        stream.sender.require_auth();
+        stream.sender.require_auth_for_args((stream_id,).into_val(&env));
 
         if stream.status.is_terminal() {
             return Err(Error::StreamTerminated);
@@ -729,7 +732,7 @@ impl FluxoraStream {
         // party who funded the stream keeps control over who is paid out.
         // Granting this to the current recipient is the *delegate* path
         // (`delegate_transfer_recipient`), gated on a recipient-issued grant.
-        stream.sender.require_auth();
+        stream.sender.require_auth_for_args((stream_id, new_recipient.clone()).into_val(&env));
 
         if !stream.transferable {
             return Err(Error::NotTransferable);
@@ -808,12 +811,12 @@ impl FluxoraStream {
             if grantor != stream.sender {
                 return Err(Error::Unauthorized);
             }
-            grantor.require_auth();
+            grantor.require_auth_for_args((stream_id, delegate.clone(), ops, expires_at).into_val(&env));
         } else if needs_recipient {
             if grantor != stream.recipient {
                 return Err(Error::Unauthorized);
             }
-            grantor.require_auth();
+            grantor.require_auth_for_args((stream_id, delegate.clone(), ops, expires_at).into_val(&env));
         } else {
             // ops == 0 is a no-op; treat it as success.
             return Ok(());
@@ -851,7 +854,7 @@ impl FluxoraStream {
         if grantor != stream.sender && grantor != stream.recipient {
             return Err(Error::Unauthorized);
         }
-        grantor.require_auth();
+        grantor.require_auth_for_args((stream_id, delegate.clone()).into_val(&env));
 
         storage::remove_delegate(&env, stream_id, &delegate);
         events::delegate_revoked(&env, stream_id, &grantor, &delegate);
@@ -866,6 +869,7 @@ impl FluxoraStream {
         delegate: Address,
         amount: Option<i128>,
     ) -> Result<i128, Error> {
+        delegate.require_auth_for_args((stream_id, amount).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::WITHDRAW)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -897,6 +901,7 @@ impl FluxoraStream {
 
     /// Cancel as a delegate. Requires [`op::CANCEL`] grant.
     pub fn delegate_cancel(env: Env, stream_id: u64, delegate: Address) -> Result<(), Error> {
+        delegate.require_auth_for_args((stream_id,).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::CANCEL)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -939,6 +944,7 @@ impl FluxoraStream {
 
     /// Pause as a delegate. Requires [`op::PAUSE`] grant.
     pub fn delegate_pause(env: Env, stream_id: u64, delegate: Address) -> Result<(), Error> {
+        delegate.require_auth_for_args((stream_id,).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::PAUSE)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -963,6 +969,7 @@ impl FluxoraStream {
 
     /// Resume as a delegate. Requires [`op::RESUME`] grant.
     pub fn delegate_resume(env: Env, stream_id: u64, delegate: Address) -> Result<(), Error> {
+        delegate.require_auth_for_args((stream_id,).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::RESUME)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -998,6 +1005,7 @@ impl FluxoraStream {
         delegate: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        delegate.require_auth_for_args((stream_id, amount).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::TOP_UP)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -1074,6 +1082,7 @@ impl FluxoraStream {
         delegate: Address,
         new_recipient: Address,
     ) -> Result<(), Error> {
+        delegate.require_auth_for_args((stream_id, new_recipient.clone()).into_val(&env));
         Self::check_delegate(&env, stream_id, &delegate, op::TRANSFER_RECIPIENT)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
@@ -1222,7 +1231,9 @@ impl FluxoraStream {
     // ---------------------------------------------------------------------
 
     /// Verify that `caller` holds a valid, unexpired delegate grant for `op`
-    /// on `stream_id`, then call `caller.require_auth()`.
+    /// on `stream_id`. Callers are expected to invoke
+    /// `caller.require_auth_for_args(...)` before calling this helper so the
+    /// authorization is scoped to the exact invocation arguments.
     ///
     /// Returns `DelegateNotPermitted` if no grant exists or the grant does not
     /// cover `op`. Returns `DelegateExpired` if the grant exists but has passed
@@ -1239,7 +1250,6 @@ impl FluxoraStream {
                 if grant.ops & op == 0 {
                     return Err(Error::DelegateNotPermitted);
                 }
-                caller.require_auth();
                 Ok(())
             }
         }

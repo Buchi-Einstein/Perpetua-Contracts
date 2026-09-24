@@ -31,10 +31,10 @@ doctest = false
 testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
-soroban-sdk = "27.0.5"
+soroban-sdk = "27.0.6"
 
 [dev-dependencies]
-soroban-sdk = { version = "27.0.5", features = ["testutils"] }
+soroban-sdk = { version = "27.0.6", features = ["testutils"] }
 proptest = "1"
 # Used by the packaging tests to parse `cargo metadata` JSON output.
 # Only a dev-dependency; never compiled into the contract WASM.
