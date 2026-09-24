@@ -303,3 +303,53 @@ fn lifecycle_operations_conserve_liability_exactly() {
     h.assert_invariants();
     assert_eq!(h.pool(), accrual::liability(&h.get(id)).unwrap());
 }
+
+/// Issue #82 — the continuous form of the pool invariant. After *every* state
+/// transition the pooled balance must exactly equal the stream's outstanding
+/// liability (`deposited - withdrawn`). A bug that moved one stroop and not the
+/// other — a refund without a liability reduction, a withdrawal without an
+/// accounting write — surfaces at the failing step instead of hiding behind a
+/// single end-state check.
+#[test]
+fn pool_equals_liability_exactly_at_every_state_transition() {
+    let h = Harness::new();
+    let id = h.create_simple(1_000 * ONE, 100 * DAY);
+
+    let check = |h: &Harness, label: &str| {
+        assert_eq!(
+            h.pool(),
+            accrual::liability(&h.get(id)).unwrap(),
+            "pooled balance diverged from liability after {label}",
+        );
+        h.assert_pool_exact();
+    };
+
+    check(&h, "create");
+
+    h.advance(50 * DAY);
+    h.client.withdraw(&id, &None);
+    check(&h, "withdraw");
+
+    h.client.top_up(&id, &(500 * ONE));
+    check(&h, "top_up");
+
+    h.client.pause(&id);
+    check(&h, "pause");
+
+    h.client.resume(&id);
+    check(&h, "resume");
+
+    h.advance(25 * DAY);
+    h.client.cancel(&id);
+    check(&h, "cancel");
+
+    // A cancelled stream keeps an unclaimed tail; drawing it must walk pool and
+    // liability down in lockstep until the claim settles at zero.
+    let tail = h.client.withdrawable_of(&id);
+    if tail > 0 {
+        assert_eq!(h.client.withdraw(&id, &None), tail);
+        check(&h, "withdraw of cancelled tail");
+    }
+    assert_eq!(h.pool(), 0, "a settled claim leaves no stranded balance");
+    check(&h, "settled");
+}
