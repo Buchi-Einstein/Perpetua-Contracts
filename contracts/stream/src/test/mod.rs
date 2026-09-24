@@ -42,6 +42,9 @@ mod token_errors;
 mod top_up;
 mod transfer;
 
+// Issue #104: capability flags are immutable — static source + runtime proof.
+mod immutability;
+
 // Stage 3
 mod accrual_overflow;
 mod batch;
