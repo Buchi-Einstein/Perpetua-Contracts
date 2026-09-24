@@ -18,7 +18,7 @@ project exists to build, verify and release it with integrity.
 | SDK | `soroban-sdk` 27.0.5 |
 | Rust | 1.97.1, target `wasm32v1-none` |
 | Token interface | SEP-41 (USDC on Stellar has **7 decimals**) |
-| Product contract size | ~47 KiB baseline; enforced by `contracts/stream/wasm-size-budget.env` |
+| Product contract size | sub-40 KiB target; enforced by `contracts/stream/wasm-size-budget.env` |
 | Tests | ~700 across four contract crates (unit, property and integration) |
 
 > **Read [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) before relying on this.**
@@ -405,6 +405,7 @@ contracts/                        the deployable contracts (standalone Cargo pro
   factory/                        policy gate (cap, duration, rate bounds, allowlist, pause)
   governance/                     timelocked multi-sig for factory policy
   archival-probe/                 throwaway archival/restore probe — never deploy
+apps/demo/                        reference Next.js + Tailwind payroll dashboard (stage 6)
 
 sdk/react-hooks/                  reference React hooks (useStream, useAccruedBalance)
 
@@ -478,6 +479,7 @@ Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.
 | [docs/griefing-analysis-extend-ttl.md](docs/griefing-analysis-extend-ttl.md) | Issue #97: formal audit of the permissionless TTL keeper surface. |
 | [docs/KNOWN-LIMITATIONS.md](docs/KNOWN-LIMITATIONS.md) | What a green suite does not prove. |
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
+| [docs/URI-SCHEME.md](docs/URI-SCHEME.md) | `stellar:stream` URI / QR-code standard for sharing a stream. |
 | [docs/soroban-rpc-read-skew.md](docs/soroban-rpc-read-skew.md) | Pin multi-call reads to one ledger, and the read-after-write barrier. |
 | [docs/provenance.md](docs/provenance.md) | Wasm provenance schema, design decisions, and the release gate. |
 | [docs/dust-theft-proof.md](docs/dust-theft-proof.md) | Why micro-top-ups cannot erode the pool or steal residue (§102). |
