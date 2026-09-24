@@ -391,6 +391,7 @@ contracts/                        the deployable contracts (standalone Cargo pro
 script/                           release, provenance, sandbox, validation automation
 tools/provenance/                 release-integrity gate: SLSA-style wasm manifests
 tests/                            validator test suite (pytest)
+sdk/                              off-chain stream math mirror (JS/BigInt)
 docs/                             ABI, limitations, migration and design documents
 ```
 
@@ -456,6 +457,8 @@ Migrating from the pre-rewrite contract? See [docs/MIGRATION.md](docs/MIGRATION.
 | [docs/MIGRATION.md](docs/MIGRATION.md) | Deletion audit vs the pre-rewrite contract, and downstream impact. |
 | [docs/soroban-rpc-read-skew.md](docs/soroban-rpc-read-skew.md) | Pin multi-call reads to one ledger, and the read-after-write barrier. |
 | [docs/provenance.md](docs/provenance.md) | Wasm provenance schema, design decisions, and the release gate. |
+| [docs/dust-theft-proof.md](docs/dust-theft-proof.md) | Why micro-top-ups cannot erode the pool or steal residue (§102). |
+| [docs/SECURITY.md](docs/SECURITY.md) | Audit scope, reporting process and bug bounty rules (§101). |
 | [fluxora-build-spec.md](fluxora-build-spec.md) | The build spec, with amendments where measurement contradicted it. |
 
 > **Note for deployment:** the `stellar` CLI must be at least version 27 to match

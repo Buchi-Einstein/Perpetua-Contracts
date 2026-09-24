@@ -5,6 +5,40 @@ The CI "Audit entrypoint drift check" step verifies this table against the sourc
 
 Last verified: 2026-08-29 (PR #1665)
 
+## Arithmetic audit (§98 — silent wrapping)
+
+There are no unchecked primitive operators on the value path. Every addition,
+subtraction, multiplication and division in `contracts/stream/src/accrual.rs`
+is either `checked_` (mapping failures to `Error::Overflow`), `saturating_`
+(clamping at the boundary) or guarded by a creation-time domain bound:
+
+| Op | Location | Behaviour |
+|---|---|---|
+| `frozen_at - paused_total` | `stream_time` | `saturating_sub`, clamps at zero |
+| `end_time - start_time` | `duration` | `saturating_sub` |
+| `clock - start_time` (capped) | `elapsed` | `saturating_sub` |
+| `deposited * consumed` | `vested` | `checked_mul` -> `Error::Overflow` |
+| `deposited / duration` | `vested` | `checked_div`, `duration == 0` short-circuit |
+| `earned - withdrawn` | `withdrawable` | `checked_sub`, saturates at zero |
+| `deposited - earned` | `refundable` | `checked_sub` |
+| `deposited - withdrawn` | `liability` | `checked_sub` |
+
+Backing guarantees:
+
+* **`overflow-checks = true`** in `contracts/stream/Cargo.toml`
+  (`[profile.release]`): even a missed `+`/`*`/`-` panics on overflow instead
+  of silently wrapping in the deployed WASM.
+* **Creation-time domain bound** (`create_stream`, lib.rs:255-271): a stream is
+  rejected unless `deposit * duration` fits in `i128`, so `deposited *
+  elapsed` inside `vested` can never overflow for a stream that reached
+  storage. `top_up` re-establishes the same bound post-extension.
+* **`u64 as i128` casts are lossless**, and `u64::MAX` fits comfortably in
+  `i128`, so no `as` cast on the value path can truncate.
+* **Typed, not trapped:** `test::accrual_overflow` (accrual_overflow.rs) drives
+  every helper at `u64::MAX` timestamps and `i128`-ceiling deposits and asserts
+  the result is `Ok(bounded)` or `Err(Error::Overflow)` — never a panic and
+  never a wrap.
+
 ## Stream Contract — `fluxora_stream`
 
 ### Lifecycle
