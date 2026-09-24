@@ -141,6 +141,59 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
 }
 
 // ---------------------------------------------------------------------------
+// Governance interface
+// ---------------------------------------------------------------------------
+
+/// The explicit interface between `FluxoraGovernance` and the factory (issue
+/// #38).
+///
+/// Governance dispatches policy updates to the factory over cross-contract
+/// calls using the entrypoint symbols named here. Declaring them as a trait
+/// makes that coupling an intentional, documented surface instead of a set of
+/// stringly-typed `invoke_contract` calls scattered through the governance
+/// `dispatch_call` match:
+///
+/// * **One place to read.** Every policy axis the governance can touch is
+///   listed here, so an upgrade to either contract starts from a single
+///   interface rather than from digging through dispatch arms.
+/// * **A compile-time contract for test doubles and wrappers.** A wrapper or
+///   mock factory only needs to implement this trait to stand in for the real
+///   contract in a governance test host.
+/// * **Backward compatibility by construction.** The `#[contractimpl]` methods
+///   below already match these signatures; the trait is a checked restatement
+///   of the existing ABI, so enforcing it never changes the deployed wire
+///   format.
+///
+/// Every method requires the factory admin's authorization, so governance must
+/// be (or have been made) the factory admin before dispatching.
+pub trait FactoryGovernance {
+    /// `set_admin(new_admin)` — rotate the factory admin.
+    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError>;
+    /// `set_stream_contract(new_stream_contract)` — point the factory at a
+    /// different `fluxora-stream` contract.
+    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError>;
+    /// `set_cap(max_deposit)` — update the per-stream capacity cap.
+    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError>;
+    /// `set_min_duration(min_duration)` — update the minimum stream duration.
+    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError>;
+    /// `set_allowlist(recipient, allowed)` — add or remove an allowlisted
+    /// recipient.
+    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError>;
+    /// `set_batch_cap_enforcement(enforced)` — toggle per-stream cap
+    /// enforcement on the batch creation path.
+    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError>;
+    /// `set_factory_paused(paused)` — pause or resume stream creation
+    /// globally.
+    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError>;
+    /// `set_rate_bounds(min, max)` — set optional per-second rate bounds.
+    fn set_rate_bounds(
+        env: Env,
+        min_rate_per_second: Option<i128>,
+        max_rate_per_second: Option<i128>,
+    ) -> Result<(), FactoryError>;
+}
+
+// ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
@@ -323,6 +376,48 @@ impl FluxoraFactory {
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
+    }
+}
+
+/// Structural implementation of the governance interface over the contract's
+/// own `#[contractimpl]` entrypoints. Each method simply forwards to the ABI
+/// method of the same name, so the trait and the deployed entrypoints can never
+/// drift apart.
+impl FactoryGovernance for FluxoraFactory {
+    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_admin(env, new_admin)
+    }
+
+    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_stream_contract(env, stream_contract)
+    }
+
+    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError> {
+        FluxoraFactory::set_cap(env, max_deposit)
+    }
+
+    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError> {
+        FluxoraFactory::set_min_duration(env, min_duration)
+    }
+
+    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_allowlist(env, recipient, allowed)
+    }
+
+    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_batch_cap_enforcement(env, enforced)
+    }
+
+    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_factory_paused(env, paused)
+    }
+
+    fn set_rate_bounds(
+        env: Env,
+        min_rate_per_second: Option<i128>,
+        max_rate_per_second: Option<i128>,
+    ) -> Result<(), FactoryError> {
+        FluxoraFactory::set_rate_bounds(env, min_rate_per_second, max_rate_per_second)
     }
 }
 
