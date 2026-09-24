@@ -77,9 +77,7 @@ fn stream_of(
         start_time: start,
         end_time: end,
         cliff_time: cliff,
-        cancellable: true,
-        pausable: true,
-        transferable: true,
+        flags: Stream::flags_from_parts(true, true, true),
         paused_total,
         paused_at,
         status: if paused_at.is_some() {

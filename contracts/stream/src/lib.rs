@@ -280,9 +280,7 @@ impl FluxoraStream {
             start_time,
             end_time,
             cliff_time,
-            cancellable,
-            pausable,
-            transferable,
+            flags: Stream::flags_from_parts(cancellable, pausable, transferable),
             paused_at: None,
             paused_total: 0,
             status: StreamStatus::Active,
@@ -581,7 +579,7 @@ impl FluxoraStream {
         let mut stream = storage::load_stream(&env, stream_id)?;
         stream.sender.require_auth();
 
-        if !stream.cancellable {
+        if !stream.cancellable() {
             return Err(Error::NotCancellable);
         }
         if stream.status.is_terminal() {
@@ -656,7 +654,7 @@ impl FluxoraStream {
         let mut stream = storage::load_stream(&env, stream_id)?;
         stream.sender.require_auth();
 
-        if !stream.pausable {
+        if !stream.pausable() {
             return Err(Error::NotPausable);
         }
         if stream.status.is_terminal() {
@@ -731,7 +729,7 @@ impl FluxoraStream {
         // (`delegate_transfer_recipient`), gated on a recipient-issued grant.
         stream.sender.require_auth();
 
-        if !stream.transferable {
+        if !stream.transferable() {
             return Err(Error::NotTransferable);
         }
         // A stream with no claim left is not reassignable. This covers both
@@ -900,7 +898,7 @@ impl FluxoraStream {
         Self::check_delegate(&env, stream_id, &delegate, op::CANCEL)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
-        if !stream.cancellable {
+        if !stream.cancellable() {
             return Err(Error::NotCancellable);
         }
         if stream.status.is_terminal() {
@@ -942,7 +940,7 @@ impl FluxoraStream {
         Self::check_delegate(&env, stream_id, &delegate, op::PAUSE)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
-        if !stream.pausable {
+        if !stream.pausable() {
             return Err(Error::NotPausable);
         }
         if stream.status.is_terminal() {
@@ -1077,7 +1075,7 @@ impl FluxoraStream {
         Self::check_delegate(&env, stream_id, &delegate, op::TRANSFER_RECIPIENT)?;
         let mut stream = storage::load_stream(&env, stream_id)?;
 
-        if !stream.transferable {
+        if !stream.transferable() {
             return Err(Error::NotTransferable);
         }
         // Same settled-claim rule as `transfer_recipient`: a stream with no

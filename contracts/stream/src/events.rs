@@ -243,9 +243,9 @@ pub fn stream_created(env: &Env, stream_id: u64, stream: &Stream) {
         start_time: stream.start_time,
         end_time: stream.end_time,
         cliff_time: stream.cliff_time,
-        cancellable: stream.cancellable,
-        pausable: stream.pausable,
-        transferable: stream.transferable,
+        cancellable: stream.cancellable(),
+        pausable: stream.pausable(),
+        transferable: stream.transferable(),
     }
     .publish(env);
 }

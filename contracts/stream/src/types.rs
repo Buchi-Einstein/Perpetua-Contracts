@@ -13,6 +13,21 @@ pub mod op {
     pub const TRANSFER_RECIPIENT: u32 = 1 << 5;
 }
 
+/// Bitmask constants for the immutable [`Stream`] behavior flags.
+///
+/// All three bits are fixed at creation and never mutate. Packing them into a
+/// single byte keeps one bit for each of `cancellable`, `pausable` and
+/// `transferable`, shrinking the serialized `Stream` entry in persistent
+/// storage by two fields.
+pub mod flag {
+    /// Stream may be cancelled by its sender.
+    pub const CANCELLABLE: u8 = 1 << 0;
+    /// Stream may be paused and resumed by its sender.
+    pub const PAUSABLE: u8 = 1 << 1;
+    /// Stream recipient may be transferred by the current recipient.
+    pub const TRANSFERABLE: u8 = 1 << 2;
+}
+
 /// A delegation grant stored in persistent storage.
 ///
 /// Scoped to one `(stream_id, delegate)` pair. The grantor is implied by which
@@ -80,12 +95,11 @@ pub struct Stream {
     /// Unix seconds in `[start_time, end_time]`. Equals `start_time` when there
     /// is no cliff. Gates withdrawal; does not delay accrual.
     pub cliff_time: u64,
-    /// Fixed at creation, never mutable. See `lib.rs` module docs.
-    pub cancellable: bool,
-    /// Fixed at creation, never mutable.
-    pub pausable: bool,
-    /// Fixed at creation, never mutable.
-    pub transferable: bool,
+    /// Fixed at creation, never mutable. Packed bitmask of [`flag`]:
+    /// `CANCELLABLE | PAUSABLE | TRANSFERABLE`. One storage byte for all three
+    /// behavior flags instead of three bool fields. See [`Stream::cancellable`]
+    /// / [`Stream::pausable`] / [`Stream::transferable`].
+    pub flags: u8,
     /// `Some(t)` while paused: the instant the accrual clock froze.
     pub paused_at: Option<u64>,
     /// Cumulative seconds spent paused, excluding any in-progress pause.
@@ -94,6 +108,28 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Whether the sender may cancel this stream.
+    pub fn cancellable(&self) -> bool {
+        self.flags & flag::CANCELLABLE != 0
+    }
+
+    /// Whether the sender may pause and resume this stream.
+    pub fn pausable(&self) -> bool {
+        self.flags & flag::PAUSABLE != 0
+    }
+
+    /// Whether the recipient may transfer its claim to a new recipient.
+    pub fn transferable(&self) -> bool {
+        self.flags & flag::TRANSFERABLE != 0
+    }
+
+    /// Build the packed flags byte from the three creation-time booleans.
+    pub fn flags_from_parts(cancellable: bool, pausable: bool, transferable: bool) -> u8 {
+        (u8::from(cancellable) & 1)
+            | ((u8::from(pausable) & 1) << 1)
+            | ((u8::from(transferable) & 1) << 2)
+    }
+
     /// Enforces the recipient-only withdrawal policy.
     ///
     /// This is the sole authorization gate for withdrawals. A stream has no

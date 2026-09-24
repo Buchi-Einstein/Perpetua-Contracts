@@ -1,0 +1,106 @@
+# Perpetua indexer schema — GraphQL (SubQuery / Envoy / custom indexers).
+#
+# Mirrors contracts/stream/src/events.rs one-for-one. Every contract state
+# change emits exactly one event; topic[0] is the struct name in snake_case
+# and stream_id is always a topic, so all types below key off stream_id.
+#
+# Versioning rule (from events.rs module docs): adding a field at the end of a
+# contract event is additive; reordering/removing/retopicing is breaking and
+# introduces a V2 event type. Indexers must tolerate unknown trailing fields.
+
+scalar BigInt      # Soroban i128 / u64 amounts; XDR encodes these as ScVal
+scalar Address     # Stellar G… / C… account or contract address string
+scalar LedgerSeq   # ledger sequence number where an event appeared
+
+enum StreamStatus {
+  Active
+  Paused
+  Cancelled
+  Depleted
+}
+
+# Current mirror of one on-chain Stream entry. Built from StreamCreated and
+# replayed forward from every subsequent event.
+type Stream {
+  streamId:         BigInt!
+  sender:           Address!
+  recipient:        Address!
+  token:            Address!
+  deposited:        BigInt!
+  withdrawn:        BigInt!
+  startTime:        BigInt!
+  endTime:          BigInt!
+  cliffTime:        BigInt!
+  cancellable:      Boolean!
+  pausable:         Boolean!
+  transferable:     Boolean!
+  pausedAt:         BigInt          # null when not paused
+  pausedTotal:      BigInt!
+  status:           StreamStatus!
+  createdAtLedger:  LedgerSeq!
+  updatedAtLedger:  LedgerSeq!
+  ttlExtendedAt:    LedgerSeq!      # last TtlExtended seen
+}
+
+type StreamCreatedEvent { streamId: BigInt!, sender: Address!, recipient: Address!, token: Address!, deposited: BigInt!, startTime: BigInt!, endTime: BigInt!, cliffTime: BigInt!, cancellable: Boolean!, pausable: Boolean!, transferable: Boolean!, ledger: LedgerSeq! }
+type WithdrawnEvent   { streamId: BigInt!, recipient: Address!, amount: BigInt!, withdrawn: BigInt!, deposited: BigInt!, status: StreamStatus!, ledger: LedgerSeq! }
+type CancelledEvent   { streamId: BigInt!, sender: Address!, recipient: Address!, refunded: BigInt!, vested: BigInt!, withdrawn: BigInt!, endTime: BigInt!, ledger: LedgerSeq! }
+type PausedEvent      { streamId: BigInt!, sender: Address!, pausedAt: BigInt!, pausedTotal: BigInt!, ledger: LedgerSeq! }
+type ResumedEvent     { streamId: BigInt!, sender: Address!, pausedDuration: BigInt!, pausedTotal: BigInt!, ledger: LedgerSeq! }
+type ToppedUpEvent    { streamId: BigInt!, sender: Address!, amount: BigInt!, deposited: BigInt!, endTime: BigInt!, ledger: LedgerSeq! }
+type RecipientTransferredEvent { streamId: BigInt!, oldRecipient: Address!, newRecipient: Address!, ledger: LedgerSeq! }
+type DelegateGrantedEvent { streamId: BigInt!, grantor: Address!, delegate: Address!, ops: Int!, expiresAt: BigInt, ledger: LedgerSeq! }
+type DelegateRevokedEvent { streamId: BigInt!, grantor: Address!, delegate: Address!, ledger: LedgerSeq! }
+type TtlExtendedEvent { streamId: BigInt!, extendedToLedgers: BigInt!, ledger: LedgerSeq! }
+
+type Query {
+  stream(id: BigInt!): Stream
+  streamsBySender(sender: Address!, first: Int, after: String): StreamConnection!
+  streamsByRecipient(recipient: Address!, first: Int, after: String): StreamConnection!
+  streamsByStatus(status: StreamStatus!, first: Int, after: String): StreamConnection!
+  events(streamId: BigInt!, fromLedger: LedgerSeq, first: Int): [Event!]!
+  eventsByEventType(
+    eventTypes: [EventType!]!
+    fromLedger: LedgerSeq
+    first: Int
+  ): [Event!]!
+}
+
+type StreamConnection {
+  nodes: [Stream!]!
+  pageInfo: PageInfo!
+}
+
+type PageInfo { hasNextPage: Boolean!, endCursor: String }
+
+union Event =
+  | StreamCreatedEvent
+  | WithdrawnEvent
+  | CancelledEvent
+  | PausedEvent
+  | ResumedEvent
+  | ToppedUpEvent
+  | RecipientTransferredEvent
+  | DelegateGrantedEvent
+  | DelegateRevokedEvent
+  | TtlExtendedEvent
+
+enum EventType {
+  stream_created
+  withdrawn
+  cancelled
+  paused
+  resumed
+  topped_up
+  recipient_transferred
+  delegate_granted
+  delegate_revoked
+  ttl_extended
+}
+
+# Realtime notifications for keepers. A keeper subscribes to ttl_extended to
+# confirm its batch sweep landed, and to stream_created to grow its id set.
+type Subscription {
+  streamUpdated(streamId: BigInt): Stream!
+  newEvent(eventType: EventType): Event!
+}
