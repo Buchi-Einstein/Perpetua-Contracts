@@ -1072,3 +1072,226 @@ fn a_ttl_batch_is_per_item_and_deterministic() {
     assert_eq!(ttl_of(&h, a), 50_000);
     assert_eq!(ttl_of(&h, b), 50_000);
 }
+
+// ---------------------------------------------------------------------------
+// Batch recipient transfer: atomic, all-or-nothing
+// ---------------------------------------------------------------------------
+
+fn transferred_event_ids(h: &Harness) -> std::vec::Vec<u64> {
+    h.env
+        .events()
+        .all()
+        .filter_by_contract(&h.contract_id)
+        .events()
+        .iter()
+        .filter_map(|event| {
+            let ContractEventBody::V0(v0) = &event.body;
+            let [ScVal::Symbol(name), ScVal::U64(stream_id), ..] = v0.topics.as_slice() else {
+                return None;
+            };
+            (name.0.as_slice() == b"recipient_transferred").then_some(*stream_id)
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_transfer_changes_every_stream_at_once() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+
+    let count = h
+        .client
+        .batch_transfer_recipient(&h.ids(&[a, b]), &h.other);
+
+    assert_eq!(count, 2);
+    assert_eq!(h.get(a).recipient, h.other);
+    assert_eq!(h.get(b).recipient, h.other);
+    assert_eq!(transferred_event_ids(&h), std::vec![a, b]);
+    h.assert_pool_exact();
+}
+
+#[test]
+fn a_batch_transfer_matches_the_same_transfers_done_one_at_a_time() {
+    let batched = {
+        let h = Harness::new();
+        let a = h.create_simple(100 * ONE, 100 * DAY);
+        let b = h.create_simple(200 * ONE, 100 * DAY);
+        h.client
+            .batch_transfer_recipient(&h.ids(&[a, b]), &h.other);
+        (h.get(a).recipient.clone(), h.get(b).recipient.clone())
+    };
+
+    let individually = {
+        let h = Harness::new();
+        let a = h.create_simple(100 * ONE, 100 * DAY);
+        let b = h.create_simple(200 * ONE, 100 * DAY);
+        h.client.transfer_recipient(&a, &h.other);
+        h.client.transfer_recipient(&b, &h.other);
+        (h.get(a).recipient.clone(), h.get(b).recipient.clone())
+    };
+
+    assert_eq!(batched, individually);
+}
+
+#[test]
+fn a_not_transferable_stream_anywhere_reverts_the_whole_batch() {
+    let h = Harness::new();
+    let a = h.create(100 * ONE, h.now(), h.now() + 100 * DAY, h.now(), true, true, false);
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+
+    let err = h
+        .client
+        .try_batch_transfer_recipient(&h.ids(&[a, b]), &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::NotTransferable);
+    assert_eq!(h.get(a).recipient, h.recipient);
+    assert_eq!(h.get(b).recipient, h.recipient);
+    assert!(transferred_event_ids(&h).is_empty());
+    h.assert_pool_exact();
+}
+
+#[test]
+fn a_terminated_stream_anywhere_reverts_the_whole_batch() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 10 * DAY);
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+    h.advance(10 * DAY);
+    h.client.withdraw(&a, &None);
+
+    let err = h
+        .client
+        .try_batch_transfer_recipient(&h.ids(&[a, b]), &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::StreamTerminated);
+    assert_eq!(h.get(a).recipient, h.recipient);
+    assert_eq!(h.get(b).recipient, h.recipient);
+    assert!(transferred_event_ids(&h).is_empty());
+    h.assert_pool_exact();
+}
+
+#[test]
+fn mixed_senders_revert_the_whole_batch() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+    let theirs = h.client.create_stream(
+        &h.sender,
+        &h.recipient,
+        &h.token,
+        &(100 * ONE),
+        &h.now(),
+        &(h.now() + 100 * DAY),
+        &h.now(),
+        &true,
+        &true,
+        &true,
+    );
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+
+    let err = h
+        .client
+        .try_batch_transfer_recipient(&h.ids(&[a, theirs, b]), &h.other)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, Error::Unauthorized);
+    assert_eq!(h.get(a).recipient, h.recipient);
+    assert_eq!(h.get(b).recipient, h.recipient);
+    assert!(transferred_event_ids(&h).is_empty());
+    h.assert_pool_exact();
+}
+
+#[test]
+fn an_empty_batch_is_rejected() {
+    let h = Harness::new();
+    let empty: Vec<u64> = Vec::new(&h.env);
+
+    assert_eq!(
+        h.client
+            .try_batch_transfer_recipient(&empty, &h.other)
+            .unwrap_err()
+            .unwrap(),
+        Error::EmptyBatch
+    );
+}
+
+#[test]
+fn an_oversized_batch_is_rejected() {
+    let h = Harness::new();
+    let ids: std::vec::Vec<u64> = (0..MAX_BATCH_SIZE + 1)
+        .map(|_| h.create_simple(100 * ONE, 100 * DAY))
+        .collect();
+
+    assert_eq!(
+        h.client
+            .try_batch_transfer_recipient(&h.ids(&ids), &h.other)
+            .unwrap_err()
+            .unwrap(),
+        Error::BatchTooLarge
+    );
+}
+
+#[test]
+fn a_duplicated_id_is_rejected() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+
+    assert_eq!(
+        h.client
+            .try_batch_transfer_recipient(&h.ids(&[a, a]), &h.other)
+            .unwrap_err()
+            .unwrap(),
+        Error::DuplicateStreamId
+    );
+    assert_eq!(h.get(a).recipient, h.recipient);
+    assert!(transferred_event_ids(&h).is_empty());
+}
+
+#[test]
+fn transferring_to_the_sender_is_rejected() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+
+    assert_eq!(
+        h.client
+            .try_batch_transfer_recipient(&h.ids(&[a, b]), &h.sender)
+            .unwrap_err()
+            .unwrap(),
+        Error::SelfStream
+    );
+}
+
+#[test]
+fn transferring_to_the_current_recipient_is_rejected() {
+    let h = Harness::new();
+    let a = h.create_simple(100 * ONE, 100 * DAY);
+    let b = h.create_simple(200 * ONE, 100 * DAY);
+
+    assert_eq!(
+        h.client
+            .try_batch_transfer_recipient(&h.ids(&[a, b]), &h.recipient)
+            .unwrap_err()
+            .unwrap(),
+        Error::RepeatedTransfer
+    );
+}
+
+#[test]
+fn a_successful_batch_emits_transferred_events_in_batch_order() {
+    let h = Harness::new();
+    let ids: std::vec::Vec<u64> = (0..4)
+        .map(|_| h.create_simple(100 * ONE, 100 * DAY))
+        .collect();
+
+    let shuffled = [ids[2], ids[0], ids[3], ids[1]];
+    h.client
+        .batch_transfer_recipient(&h.ids(&shuffled), &h.other);
+
+    assert_eq!(transferred_event_ids(&h), shuffled, "events out of batch order");
+    for id in &ids {
+        assert_eq!(h.get(*id).recipient, h.other);
+    }
+    h.assert_pool_exact();
+}

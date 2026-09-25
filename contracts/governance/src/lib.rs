@@ -1839,6 +1839,102 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // update_threshold — dynamic threshold updates (issue #42)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_threshold_updates_value_and_emits_event() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        ctx.client.update_threshold(&3u32);
+
+        let (topic, data) = last_contract_event(&ctx.env, &ctx.contract_id);
+        assert_eq!(ctx.client.quorum(), 3);
+        assert_eq!(topic, symbol_short!("quor_cfg"));
+        let payload = QuorumConfig::try_from_val(&ctx.env, &data).expect("decodes to QuorumConfig");
+        assert_eq!(payload.threshold, 3);
+        assert_eq!(payload.signer_count, 3);
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_zero() {
+        let ctx = Ctx::setup();
+        let events_before = ctx.env.events().all().events().len();
+
+        let result = ctx.client.try_update_threshold(&0u32);
+
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_above_signer_count() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        let events_before = ctx.env.events().all().events().len();
+
+        let result = ctx.client.try_update_threshold(&4u32);
+
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
+    }
+
+    #[test]
+    fn test_update_threshold_accepts_one() {
+        let ctx = Ctx::setup();
+
+        ctx.client.update_threshold(&1u32);
+
+        assert_eq!(ctx.client.quorum(), 1);
+    }
+
+    #[test]
+    fn test_update_threshold_accepts_valid_range() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        ctx.client.update_threshold(&1u32);
+        assert_eq!(ctx.client.quorum(), 1);
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+        ctx.client.update_threshold(&2u32);
+        assert_eq!(ctx.client.quorum(), 2);
+    }
+
+    #[test]
+    fn test_update_threshold_requires_admin_auth() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        client.init(&admin, &vec![&env, signer_a, signer_b, signer_c], &2u32);
+
+        // No mock_all_auths: require_auth() on the admin address fails at the
+        // host level, so the threshold must remain untouched.
+        let result = client.try_update_threshold(&3u32);
+        assert!(
+            result.is_err(),
+            "update_threshold should abort without admin auth"
+        );
+        assert_eq!(client.quorum(), 2);
+    }
+
+    #[test]
+    fn test_update_threshold_after_signer_removal_respects_current_count() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        ctx.client.remove_signer(&ctx.signer_c); // Now 2 signers
+        ctx.client.update_threshold(&2u32);
+        assert_eq!(ctx.client.quorum(), 2);
+        // 3 > 2 remaining signers — must be rejected.
+        let result = ctx.client.try_update_threshold(&3u32);
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+    }
+
+    // -----------------------------------------------------------------------
     // Quorum invariant on remove_signer
     // -----------------------------------------------------------------------
 
@@ -2182,6 +2278,73 @@ mod tests {
         let p = ctx.client.get_proposal(&id);
         assert!(p.executed);
         assert_eq!(p.target, target);
+    }
+
+    /// End-to-end multi-sig threshold update flow (issue #42): the admin moves
+    /// the approval threshold from 2-of-3 to 3-of-3, and a proposal submitted
+    /// *after* the change requires the new threshold before it can execute.
+    #[test]
+    fn test_threshold_update_enforced_end_to_end() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        // Admin raises the threshold before the new proposal is queued.
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+
+        let target = ctx.dummy_target();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &target, &ctx.calldata("post-update"));
+
+        // Two approvals no longer reach the new 3-of-3 threshold.
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert_eq!(p.approvals.len(), 2);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        let result = ctx.client.try_execute(&executor, &id);
+        assert_eq!(result, Err(Ok(GovernanceError::QuorumNotReached)));
+
+        // The third signer brings the proposal to quorum under the new threshold.
+        ctx.client.approve(&ctx.signer_c, &id);
+        // Quorum was only reached once the third vote landed, so the timelock
+        // clock starts from that moment, not from the earlier warp.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK * 2 + 1);
+        ctx.client.execute(&executor, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert!(p.executed);
+    }
+
+    /// In-flight proposals snapshot the threshold at quorum time: a proposal
+    /// that reached 2-of-3 quorum before the admin raised the threshold to 3
+    /// remains executable, because the change cannot rewrite history.
+    #[test]
+    fn test_threshold_change_does_not_retroactively_invalidate_quorum() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        let id = ctx.client.propose(
+            &ctx.signer_a,
+            &ctx.dummy_target(),
+            &ctx.calldata("pre-update"),
+        );
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id); // quorum reached at threshold 2
+
+        // Admin raises the threshold afterwards — precisely the race the
+        // QuorumInfo snapshot guard exists for.
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+
+        let quorum_info = ctx.client.get_quorum_info(&id).unwrap();
+        assert_eq!(quorum_info.threshold, 2); // snapshot, not the live value
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        ctx.client.execute(&executor, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert!(p.executed);
     }
 
     #[test]

@@ -16,9 +16,20 @@
 //! stream safe for an untrusted recipient to accept. The factory is the layer
 //! that *does* carry policy: a treasury that wants its on-chain creators to
 //! respect caps and minimums pins this contract in front of stream creation.
+//!
+//! ## Admin rotation (issue #39)
+//!
+//! The factory gates every policy setter behind a single admin key. Because a
+//! single-step rotation can destructively transfer control (or, worse, rotate
+//! it onto an un-signable key), the factory supports an optional two-step
+//! hand-off: `propose_admin` nominates a successor, and `accept_admin` — called
+//! by that successor — completes the transfer and immediately revokes the
+//! previous admin. The zero address and the factory's own address are rejected
+//! outright as admin candidates in both the single-step and two-step paths.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Env, String,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +55,9 @@ pub enum DataKey {
     Config,
     /// Presence of an address under this key means it is allowlisted.
     Allowlist(Address),
+    /// The proposed next admin for the two-step rotation hand-off. Written by
+    /// `propose_admin`, consumed (and cleared) by `accept_admin`.
+    PendingAdmin,
 }
 
 /// The full on-chain configuration record.
@@ -100,6 +114,30 @@ pub enum FactoryError {
     Unauthorized = 3,
     /// The recipient is not allowlisted.
     AllowlistDenied = 4,
+    /// The proposed admin cannot be set: it is the zero address or the factory
+    /// contract itself, either of which would permanently lock the factory.
+    InvalidNewAdmin = 5,
+    /// `accept_admin` was called but no admin transfer has been proposed.
+    NoPendingAdmin = 6,
+}
+
+/// Emitted when an admin rotation is proposed (two-step hand-off, issue #39).
+#[contractevent]
+pub struct AdminTransferProposed {
+    #[topic]
+    pub current: Address,
+    #[topic]
+    pub pending: Address,
+}
+
+/// Emitted when the proposed admin accepts the hand-off. From this moment the
+/// previous admin is immediately revoked.
+#[contractevent]
+pub struct AdminTransferred {
+    #[topic]
+    pub previous: Address,
+    #[topic]
+    pub new: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,56 +179,25 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
 }
 
 // ---------------------------------------------------------------------------
-// Governance interface
+// Admin rotation guards
 // ---------------------------------------------------------------------------
 
-/// The explicit interface between `FluxoraGovernance` and the factory (issue
-/// #38).
-///
-/// Governance dispatches policy updates to the factory over cross-contract
-/// calls using the entrypoint symbols named here. Declaring them as a trait
-/// makes that coupling an intentional, documented surface instead of a set of
-/// stringly-typed `invoke_contract` calls scattered through the governance
-/// `dispatch_call` match:
-///
-/// * **One place to read.** Every policy axis the governance can touch is
-///   listed here, so an upgrade to either contract starts from a single
-///   interface rather than from digging through dispatch arms.
-/// * **A compile-time contract for test doubles and wrappers.** A wrapper or
-///   mock factory only needs to implement this trait to stand in for the real
-///   contract in a governance test host.
-/// * **Backward compatibility by construction.** The `#[contractimpl]` methods
-///   below already match these signatures; the trait is a checked restatement
-///   of the existing ABI, so enforcing it never changes the deployed wire
-///   format.
-///
-/// Every method requires the factory admin's authorization, so governance must
-/// be (or have been made) the factory admin before dispatching.
-pub trait FactoryGovernance {
-    /// `set_admin(new_admin)` — rotate the factory admin.
-    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError>;
-    /// `set_stream_contract(new_stream_contract)` — point the factory at a
-    /// different `fluxora-stream` contract.
-    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError>;
-    /// `set_cap(max_deposit)` — update the per-stream capacity cap.
-    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError>;
-    /// `set_min_duration(min_duration)` — update the minimum stream duration.
-    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError>;
-    /// `set_allowlist(recipient, allowed)` — add or remove an allowlisted
-    /// recipient.
-    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError>;
-    /// `set_batch_cap_enforcement(enforced)` — toggle per-stream cap
-    /// enforcement on the batch creation path.
-    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError>;
-    /// `set_factory_paused(paused)` — pause or resume stream creation
-    /// globally.
-    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError>;
-    /// `set_rate_bounds(min, max)` — set optional per-second rate bounds.
-    fn set_rate_bounds(
-        env: Env,
-        min_rate_per_second: Option<i128>,
-        max_rate_per_second: Option<i128>,
-    ) -> Result<(), FactoryError>;
+/// The all-zeros Stellar account (`G…WHF`). Anything signed by this key does
+/// not exist, so installing it as admin would permanently burn the factory's
+/// control surface. The factory refuses it everywhere an admin can be set.
+fn is_zero_address(env: &Env, addr: &Address) -> bool {
+    let zero = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    *addr == zero
+}
+
+/// An address that must never become admin: the zero account (which cannot
+/// sign) or the factory's own contract address (which would make the factory
+/// its own admin and lock every setter behind a self-authorization).
+fn is_forbidden_admin(env: &Env, addr: &Address) -> bool {
+    is_zero_address(env, addr) || *addr == env.current_contract_address()
 }
 
 // ---------------------------------------------------------------------------
@@ -294,12 +301,105 @@ impl FluxoraFactory {
     }
 
     /// Rotate the admin address.
+    ///
+    /// # Burn protection
+    ///
+    /// Rejects the zero address (`G…WHF`) and the factory's own contract
+    /// address: both would silently lock every policy setter behind an
+    /// unreachable signature. For a safer hand-off use the two-step
+    /// [`propose_admin`](Self::propose_admin) / [`accept_admin`](Self::accept_admin)
+    /// pair instead.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
+        if is_forbidden_admin(&env, &new_admin) {
+            return Err(FactoryError::InvalidNewAdmin);
+        }
         config.admin = new_admin;
         env.storage().instance().set(&DataKey::Config, &config);
+        // A single-step rotation while a two-step hand-off is pending would
+        // leave a stale PendingAdmin behind; clear it so accept_admin cannot
+        // later resurrect a superseded proposal.
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         bump_instance(&env);
         Ok(())
+    }
+
+    /// Nominate the next admin for a two-step transfer (issue #39).
+    ///
+    /// The pending admin takes over only after they call
+    /// [`accept_admin`](Self::accept_admin); until then the current admin keeps
+    /// full authority. This gives a rotating key a chance to prove it can sign
+    /// before it is handed the factory.
+    ///
+    /// # Authorization
+    /// - Requires the current admin's signature.
+    ///
+    /// # Errors
+    /// - `InvalidNewAdmin`: the proposed address is the zero address or the
+    ///   factory itself.
+    /// - `Unauthorized`: the caller is not the current admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        let config = Self::guard(&env)?;
+        if is_forbidden_admin(&env, &new_admin) {
+            return Err(FactoryError::InvalidNewAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance(&env);
+
+        // CEI: the pending nomination is persisted before the event is emitted.
+        AdminTransferProposed {
+            current: config.admin,
+            pending: new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accept a pending admin nomination and complete the transfer.
+    ///
+    /// The caller must be the exact address stored by [`propose_admin`](Self::propose_admin).
+    /// On success the previous admin is **immediately revoked** — every setter
+    /// re-checks the current admin, which is now the new address — and the
+    /// pending nomination is consumed.
+    ///
+    /// # Errors
+    /// - `NoPendingAdmin`: no transfer has been proposed.
+    pub fn accept_admin(env: Env) -> Result<(), FactoryError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(FactoryError::NoPendingAdmin)?;
+        // The caller must *be* the pending admin; any other address fails here.
+        pending.require_auth();
+
+        let mut config = load_config(&env)?;
+        let previous = config.admin;
+        config.admin = pending;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&env);
+
+        // CEI: the transfer is persisted before the event is emitted.
+        AdminTransferred {
+            previous,
+            new: config.admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// The currently nominated successor, if a two-step transfer is pending.
+    ///
+    /// # Errors
+    /// - `NotInitialized`: No policy record exists.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        load_config(&env).map_or_else(
+            |e| panic_with_error!(&env, e),
+            |_| env.storage().instance().get(&DataKey::PendingAdmin),
+        )
     }
 
     /// Point the factory at a different `fluxora-stream` contract.
