@@ -506,6 +506,13 @@ fn get_signers(env: &Env) -> Result<Vec<Address>, GovernanceError> {
         .ok_or(GovernanceError::NotInitialized)
 }
 
+fn get_emergency_guardians(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyGuardians)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
 fn get_threshold(env: &Env) -> Result<u32, GovernanceError> {
     env.storage()
         .instance()
@@ -658,6 +665,30 @@ impl FluxoraGovernance {
             },
         );
 
+        Ok(())
+    }
+
+    /// Set the emergency guardian addresses.
+    pub fn set_emergency_guardians(
+        env: Env,
+        guardians: Vec<Address>,
+    ) -> Result<(), GovernanceError> {
+        get_admin(&env)?.require_auth();
+        if guardians.len() > MAX_SIGNERS {
+            return Err(GovernanceError::TooManyEmergencyGuardians);
+        }
+        for i in 0..guardians.len() {
+            let guardian = guardians.get(i).unwrap();
+            for j in (i + 1)..guardians.len() {
+                if guardians.get(j) == Some(guardian.clone()) {
+                    return Err(GovernanceError::DuplicateEmergencyGuardian);
+                }
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyGuardians, &guardians);
+        bump_instance(&env);
         Ok(())
     }
 
@@ -1139,9 +1170,17 @@ impl FluxoraGovernance {
             ProposalStatus::Proposed | ProposalStatus::Approved | ProposalStatus::Queued => {}
         }
 
-        // Only the original proposer or the admin may cancel.
+        // The original proposer, admin, or a configured emergency guardian may cancel.
         let admin = get_admin(&env)?;
-        if caller != proposal.proposer && caller != admin {
+        let guardians = get_emergency_guardians(&env);
+        let mut is_guardian = false;
+        for i in 0..guardians.len() {
+            if guardians.get(i) == Some(caller.clone()) {
+                is_guardian = true;
+                break;
+            }
+        }
+        if caller != proposal.proposer && caller != admin && !is_guardian {
             return Err(GovernanceError::NotProposerOrAdmin);
         }
 
@@ -1206,6 +1245,11 @@ impl FluxoraGovernance {
     /// Returns `GovernanceError::NotInitialized` if `init` has not been called.
     pub fn get_admin(env: Env) -> Result<Address, GovernanceError> {
         get_admin(&env)
+    }
+
+    /// Return the configured emergency guardian addresses.
+    pub fn get_emergency_guardians(env: Env) -> Vec<Address> {
+        get_emergency_guardians(&env)
     }
 
     /// Return the configured approval threshold.
@@ -2265,6 +2309,47 @@ mod tests {
         let result = ctx.client.try_cancel_proposal(&ctx.signer_a, &id);
         assert_eq!(result, Err(Ok(GovernanceError::ProposalCancelled)));
     }
+    #[test]
+    fn test_emergency_guardian_cancels_queued_proposal() {
+        let ctx = Ctx::setup();
+        let guardian = Address::generate(&ctx.env);
+        ctx.client
+            .set_emergency_guardians(&vec![&ctx.env, guardian.clone()]);
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+
+        ctx.client.cancel_proposal(&guardian, &id);
+        assert!(ctx.client.get_proposal(&id).cancelled);
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+        assert_eq!(
+            ctx.client.try_approve(&ctx.signer_c, &id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+    }
+
+    #[test]
+    fn test_non_guardian_cannot_cancel_queued_proposal() {
+        let ctx = Ctx::setup();
+        let stranger = Address::generate(&ctx.env);
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        assert_eq!(
+            ctx.client.try_cancel_proposal(&stranger, &id),
+            Err(Ok(GovernanceError::NotProposerOrAdmin))
+        );
+    }
+
+
 
     #[test]
     fn test_cancel_executed_proposal_errors() {
