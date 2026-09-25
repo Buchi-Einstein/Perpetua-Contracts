@@ -24,6 +24,14 @@ const MAX_CALLDATA_BYTES: u32 = 4_096;
 /// non-executable. Default: 30 days.
 const MAX_PROPOSAL_AGE_SECONDS: u64 = 2_592_000;
 
+/// Default grace window in seconds after a proposal's `eta` (executable-after
+/// timestamp) during which it may still be executed. Default: 28 days.
+///
+/// `eta = quorum_reached_at + GOVERNANCE_TIMELOCK_SECONDS`, so this default
+/// keeps the execution window aligned with the 30-day `MAX_PROPOSAL_AGE_SECONDS`
+/// hard cap for proposals whose quorum was reached at proposal time.
+const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 2_419_200;
+
 /// Maximum number of proposals that `get_proposals_by_id_range` will return in
 /// a single call.
 ///
@@ -1114,6 +1122,15 @@ impl FluxoraGovernance {
             return Err(GovernanceError::TimelockNotMet);
         }
 
+        // Grace window: a proposal that passed its `eta` more than
+        // `grace_period` seconds ago is stale and can no longer be executed
+        // (#46). Execution is still allowed exactly at the `eta + grace_period`
+        // boundary; the check is strictly `now > deadline`.
+        let deadline = checked_deadline(exec_after, get_grace_period(&env))?;
+        if now > deadline {
+            return Err(GovernanceError::ProposalExpired);
+        }
+
         // CEI: mark as executed before emitting the event.
         proposal.status = ProposalStatus::Executed;
         proposal.executed = true;
@@ -1199,6 +1216,86 @@ impl FluxoraGovernance {
         );
 
         Ok(())
+    }
+
+    /// Prune expired, unexecuted proposals from persistent storage to reclaim
+    /// ledger rent (#46).
+    ///
+    /// A proposal is prunable when it is neither executed nor cancelled and its
+    /// `timestamp > created_at + MAX_PROPOSAL_AGE_SECONDS` (hard max-age cap) or
+    /// its `timestamp > eta + grace_period` (post-eta grace window). The helper
+    /// only ever deletes data that is logically dead: such a proposal can never
+    /// be approved or executed again.
+    ///
+    /// Removes the proposal record, its `QuorumInfo` snapshot, and its
+    /// per-proposal approval index from persistent storage so indexers and
+    /// dashboards no longer pay rent for stale state.
+    ///
+    /// # Parameters
+    /// - `start_id`: First proposal ID to consider (inclusive).
+    /// - `limit`: Maximum number of IDs to scan. Hard-capped at
+    ///   [`MAX_PAGE_SIZE`]. IDs that do not exist, are executed, or are
+    ///   cancelled are skipped silently.
+    ///
+    /// # Returns
+    /// The number of proposals actually removed from storage.
+    ///
+    /// # Authorization
+    /// None — pruning only removes entries that are already non-executable, so
+    /// it can be invoked by anyone (e.g. a keeper) without admin approval.
+    pub fn prune_expired_proposals(
+        env: Env,
+        start_id: u32,
+        limit: u32,
+    ) -> Result<u32, GovernanceError> {
+        bump_instance(&env);
+
+        let page_size = limit.min(MAX_PAGE_SIZE);
+        let total = read_next_proposal_id(&env);
+        if start_id >= total || page_size == 0 {
+            return Ok(0u32);
+        }
+
+        let end_exclusive = start_id.saturating_add(page_size).min(total);
+        let mut pruned = 0u32;
+        let mut current = start_id;
+        while current < end_exclusive {
+            let proposal = match env
+                .storage()
+                .persistent()
+                .get::<DataKey, Proposal>(&DataKey::Proposal(current))
+            {
+                Some(p) => p,
+                None => {
+                    current += 1;
+                    continue;
+                }
+            };
+
+            if proposal.executed || proposal.cancelled {
+                current += 1;
+                continue;
+            }
+
+            if !Self::proposal_is_expired(&env, current, &proposal)? {
+                current += 1;
+                continue;
+            }
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Proposal(current));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::QuorumReachedAt(current));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ProposalApprovalIdx(current));
+            pruned += 1;
+            current += 1;
+        }
+
+        Ok(pruned)
     }
 
     // -----------------------------------------------------------------------
@@ -1376,6 +1473,12 @@ impl FluxoraGovernance {
             return Ok(false);
         }
 
+        // Mirror of the grace-window gate in [execute](Self::execute).
+        let deadline = checked_deadline(exec_after, get_grace_period(&env))?;
+        if now > deadline {
+            return Ok(false);
+        }
+
         Ok(true)
     }
 
@@ -1523,6 +1626,38 @@ impl FluxoraGovernance {
     fn is_registered_signer(env: &Env, addr: &Address) -> Result<bool, GovernanceError> {
         let index = get_signer_index(env)?;
         Ok(index.contains_key(addr.clone()))
+    }
+
+    /// Returns `true` when a proposal has passed its execution window and is
+    /// logically dead (non-executable, eligible for pruning).
+    ///
+    /// Mirrors the two expiry gates enforced by [`execute`](Self::execute):
+    /// 1. `now > created_at + MAX_PROPOSAL_AGE_SECONDS` (hard max-age cap).
+    /// 2. `now > eta + grace_period` once quorum has been reached.
+    ///
+    /// Any `ArithmeticOverflow` bubbles up to the caller; callers that already
+    /// loaded the proposal pass it in so we avoid a redundant storage read.
+    fn proposal_is_expired(
+        env: &Env,
+        id: u32,
+        proposal: &Proposal,
+    ) -> Result<bool, GovernanceError> {
+        let now = env.ledger().timestamp();
+        if now > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)? {
+            return Ok(true);
+        }
+        if let Some(info) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, QuorumInfo>(&DataKey::QuorumReachedAt(id))
+        {
+            let eta = checked_deadline(info.reached_at, GOVERNANCE_TIMELOCK_SECONDS)?;
+            let deadline = checked_deadline(eta, get_grace_period(env))?;
+            if now > deadline {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -2506,6 +2641,173 @@ mod tests {
     }
 
 
+
+    // -----------------------------------------------------------------------
+    // Grace period / stale-proposal expiry (#46)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_grace_period_defaults_after_init() {
+        let ctx = Ctx::setup();
+        assert_eq!(
+            ctx.client.grace_period(),
+            DEFAULT_GRACE_PERIOD_SECONDS,
+            "init must persist the default grace period"
+        );
+    }
+
+    #[test]
+    fn test_grace_period_pre_init_returns_default() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        assert_eq!(client.grace_period(), DEFAULT_GRACE_PERIOD_SECONDS);
+    }
+
+    #[test]
+    fn test_set_grace_period_updates_value() {
+        let ctx = Ctx::setup();
+        ctx.client.set_grace_period(&30_000u64);
+        assert_eq!(ctx.client.grace_period(), 30_000);
+    }
+
+    #[test]
+    fn test_set_grace_period_requires_admin_auth() {
+        // Without mock_all_auths, `require_auth()` fails at the host layer, so
+        // the call must fail and leave the grace period unchanged.
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        client.init(&admin, &vec![&env, signer_a, signer_b], &1u32);
+        assert!(client.try_set_grace_period(&42u64).is_err());
+        assert_eq!(client.grace_period(), DEFAULT_GRACE_PERIOD_SECONDS);
+    }
+
+    #[test]
+    fn test_execute_rejects_proposal_past_eta_plus_grace_period() {
+        let ctx = Ctx::setup();
+        ctx.client.set_grace_period(&1000u64);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+
+        let eta = 1_000_000 + TIMELOCK; // quorum reached at 1_000_000
+        let executor = Address::generate(&ctx.env);
+
+        // Exactly at eta + grace_period — still executable (boundary is `>`).
+        ctx.env.ledger().set_timestamp(eta + 1000);
+        assert!(
+            ctx.client.try_execute(&executor, &id).is_ok(),
+            "execution must be allowed exactly at eta + grace_period"
+        );
+
+        // One second past eta + grace_period — rejected as expired.
+        let id2 = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("y"));
+        ctx.client.approve(&ctx.signer_a, &id2);
+        ctx.client.approve(&ctx.signer_b, &id2);
+        ctx.env.ledger().set_timestamp(eta + 1001);
+        let result = ctx.client.try_execute(&executor, &id2);
+        assert_eq!(result, Err(Ok(GovernanceError::ProposalExpired)));
+        // The rejected proposal must NOT have been marked executed.
+        assert!(!ctx.client.get_proposal(&id2).executed);
+    }
+
+    #[test]
+    fn test_execute_grace_period_expiry_updates_executable_view() {
+        let ctx = Ctx::setup();
+        ctx.client.set_grace_period(&1000u64);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+
+        let eta = 1_000_000 + TIMELOCK;
+        ctx.env.ledger().set_timestamp(eta + 999);
+        assert!(ctx.client.is_executable(&id));
+
+        ctx.env.ledger().set_timestamp(eta + 1001);
+        assert!(!ctx.client.is_executable(&id));
+    }
+
+    #[test]
+    fn test_prune_expired_proposals_removes_only_stale_entries() {
+        let ctx = Ctx::setup();
+        ctx.client.set_grace_period(&1000u64);
+
+        // p0: reaches quorum, then waits past eta + grace_period -> stale.
+        let p0 = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("a"));
+        ctx.client.approve(&ctx.signer_a, &p0);
+        ctx.client.approve(&ctx.signer_b, &p0);
+
+        // p1: reaches quorum, but is executed.
+        let p1 = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("b"));
+        ctx.client.approve(&ctx.signer_a, &p1);
+        ctx.client.approve(&ctx.signer_b, &p1);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        ctx.client.execute(&Address::generate(&ctx.env), &p1);
+
+        // p2: cancelled -> never pruned.
+        let p2 = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("c"));
+        ctx.client.cancel_proposal(&ctx.signer_a, &p2);
+
+        // p3: fresh proposal, still well within its grace window.
+        let p3 = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("d"));
+
+        // Advance time so p0 is stale but p3 is still fresh.
+        ctx.env
+            .ledger()
+            .set_timestamp(1_000_000 + TIMELOCK + 1001);
+
+        let pruned = ctx.client.prune_expired_proposals(&0, &100);
+        assert_eq!(pruned, 1, "exactly p0 must be pruned");
+
+        // p0 removed from storage.
+        assert_eq!(
+            ctx.client.try_get_proposal(&p0),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        // Its approval index and quorum snapshot are gone too (verify via range).
+        assert!(!ctx.client.get_quorum_info(&p0).is_some());
+
+        // p1, p2, p3 unaffected.
+        assert!(ctx.client.get_proposal(&p1).is_ok());
+        assert!(ctx.client.get_proposal(&p2).is_ok());
+        assert!(ctx.client.get_proposal(&p3).is_ok());
+
+        // A second pass finds nothing left to prune.
+        assert_eq!(ctx.client.prune_expired_proposals(&0, &100), 0);
+    }
+
+    #[test]
+    fn test_prune_expired_proposals_empty_range_and_pre_init() {
+        // start_id beyond all proposals -> 0.
+        let ctx = Ctx::setup();
+        assert_eq!(ctx.client.prune_expired_proposals(&999, &10), 0);
+        // Pre-init contract: no proposals, empty range -> 0.
+        let env = Env::default();
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        assert_eq!(client.prune_expired_proposals(&0, &10), 0);
+    }
 
     // -----------------------------------------------------------------------
     // Full happy path (regression)
