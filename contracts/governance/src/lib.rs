@@ -1074,8 +1074,37 @@ impl FluxoraGovernance {
     /// - `QuorumNotReached`: Approval count < threshold.
     /// - `TimelockNotMet`: The current ledger timestamp is before the proposal eta.
     /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot be represented.
+    ///
+    /// # Security
+    /// The execution engine is protected against reentrancy:
+    /// 1. Checks-Effects-Interactions: the proposal is marked `executed` (the
+    ///    "effect") *before* the untrusted target call (the "interaction"),
+    ///    so a reentrant call can never trigger a second execution of the same
+    ///    proposal.
+    /// 2. Non-reentrancy guard: the `Executing` in-flight flag rejects *any*
+    ///    reentrant `execute` — including for a different proposal — while a
+    ///    dispatch is in progress.
     pub fn execute(env: Env, executor: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         executor.require_auth();
+
+        // SECURITY AUDIT (reentrancy):
+        // The execution engine is *not* reentrant. `dispatch_call` invokes
+        // arbitrary cross-contract code that could attempt to call back into
+        // `execute` to push a second proposal through before the current
+        // dispatch returns (a classic governance reentrancy attack). The
+        // in-flight `Executing` flag, combined with Checks-Effects-Interactions
+        // below, makes double execution impossible:
+        //   - CEI: the proposal is marked `executed` *before* any external call.
+        //   - Guard: any reentrant `execute` while a dispatch is in progress is
+        //     rejected with `ReentrancyGuard` — including for *other* proposals.
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Executing)
+            .unwrap_or(false)
+        {
+            return Err(GovernanceError::ReentrancyGuard);
+        }
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
@@ -1137,12 +1166,21 @@ impl FluxoraGovernance {
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
 
-        // Dispatch the on-chain call to the target contract.  This runs after
-        // the proposal is marked executed so re-entrancy cannot trigger a
-        // second execution (CEI).  If the call panics (target rejects the
-        // operation), the whole transaction is reverted — including the
-        // `executed = true` write — which is the correct fail-safe behaviour.
-        dispatch_call(&env, &proposal.target, &proposal.calldata)?;
+        // SECURITY AUDIT (reentrancy):
+        // Raise the in-flight flag immediately before the (untrusted) target
+        // call and lower it immediately afterwards. If an error/normal return
+        // leaves the flag set it is harmless because any later *new* call to
+        // `execute` simply observes `Executing == true` and fails the guard —
+        // and a panic inside `dispatch_call` reverts the whole transaction,
+        // rolling the flag (and every other write) back.
+        env.storage()
+            .instance()
+            .set(&DataKey::Executing, &true);
+        let dispatched = dispatch_call(&env, &proposal.target, &proposal.calldata);
+        env.storage()
+            .instance()
+            .set(&DataKey::Executing, &false);
+        dispatched?;
 
         env.events().publish(
             (symbol_short!("executed"), proposal_id),
@@ -3730,5 +3768,194 @@ mod tests {
             ctx.client.try_execute(&executor, &id3),
             Err(Ok(GovernanceError::ProposalExpired))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reentrancy protection (#47)
+    // -----------------------------------------------------------------------
+
+    /// Storage for the hostile reentrant mock target.
+    #[contracttype]
+    pub enum ReentrantDataKey {
+        /// Governance contract id to re-enter (set by `arm`).
+        Governance,
+        /// Executor to use for the reentrant `execute` attempt (arm).
+        Executor,
+        /// Proposal id the mock attempts to re-execute (arm).
+        Proposal,
+        /// True iff the reentrant `execute` unexpectedly returned `Ok`.
+        Reentered,
+        /// True iff the reentrant `execute` was rejected by `ReentrancyGuard`.
+        GuardBlocked,
+    }
+
+    /// Mock evil target: when governance dispatches `set_admin` to it, it tries
+    /// to re-enter governance's `execute` for the armed proposal. It records
+    /// whether its reentrant call (a) succeeded or (b) was blocked by the
+    /// non-reentrancy guard, then returns `Ok` so the outer dispatch completes.
+    #[contract]
+    pub struct ReentrantMock;
+
+    #[contractimpl]
+    impl ReentrantMock {
+        /// Configure the reentrancy attempt before execution.
+        pub fn arm(
+            env: Env,
+            governance_id: Address,
+            executor: Address,
+            proposal_id: u32,
+        ) {
+            env.storage().instance().set(&ReentrantDataKey::Governance, &governance_id);
+            env.storage().instance().set(&ReentrantDataKey::Executor, &executor);
+            env.storage().instance().set(&ReentrantDataKey::Proposal, &proposal_id);
+        }
+
+        /// Invoked by governance's `StreamSetAdmin` dispatch. Attempts a
+        /// reentrant `execute` and records the outcome.
+        pub fn set_admin(env: Env, _new_admin: Address) {
+            let governance_id: Address = env
+                .storage()
+                .instance()
+                .get(&ReentrantDataKey::Governance)
+                .expect("mock must be armed before use");
+            let executor: Address = env
+                .storage()
+                .instance()
+                .get(&ReentrantDataKey::Executor)
+                .expect("mock must be armed before use");
+            let proposal_id: u32 = env
+                .storage()
+                .instance()
+                .get(&ReentrantDataKey::Proposal)
+                .expect("mock must be armed before use");
+
+            let client = FluxoraGovernanceClient::new(&env, &governance_id);
+            let outcome = client.try_execute(&executor, &proposal_id);
+            let reentered = outcome.is_ok();
+            let guard_blocked = matches!(
+                outcome,
+                Err(Ok(GovernanceError::ReentrancyGuard))
+            );
+
+            env.storage()
+                .instance()
+                .set(&ReentrantDataKey::Reentered, &reentered);
+            env.storage()
+                .instance()
+                .set(&ReentrantDataKey::GuardBlocked, &guard_blocked);
+        }
+
+        pub fn reentered(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantDataKey::Reentered)
+                .unwrap_or(false)
+        }
+
+        pub fn guard_blocked(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&ReentrantDataKey::GuardBlocked)
+                .unwrap_or(false)
+        }
+    }
+
+    fn executed_event_count(env: &Env, contract_id: &Address) -> u32 {
+        use soroban_sdk::xdr::ContractEventBody;
+        let mut count = 0u32;
+        for event in env
+            .events()
+            .all()
+            .filter_by_contract(contract_id)
+            .events()
+            .iter()
+        {
+            let ContractEventBody::V0(body) = &event.body;
+            if let Some(topic) = body.topics.first() {
+                let val = Val::try_from_val(env, topic).expect("topic converts");
+                let sym = Symbol::try_from_val(env, &val).expect("topic is a symbol");
+                if sym == symbol_short!("executed") {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn test_reentrant_execute_of_same_proposal_blocked() {
+        use soroban_sdk::xdr::ToXdr;
+        let ctx = Ctx::setup();
+        let mock_id = ctx.env.register_contract(None, ReentrantMock);
+        let mock_client = ReentrantMockClient::new(&ctx.env, &mock_id);
+        let executor = Address::generate(&ctx.env);
+        let new_admin = Address::generate(&ctx.env);
+
+        let id = ctx.client.propose(
+            &ctx.signer_a,
+            &mock_id,
+            &CallData::StreamSetAdmin(new_admin).to_xdr(&ctx.env),
+        );
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+
+        mock_client.arm(&ctx.contract_id, &executor, &id);
+
+        // The legit execution must succeed…
+        let result = ctx.client.try_execute(&executor, &id);
+        assert!(result.is_ok(), "legit execution must succeed");
+        // …the reentrant attempt inside the target must fail safely…
+        assert!(
+            mock_client.guard_blocked(),
+            "reentrant execute must be rejected by the non-reentrancy guard"
+        );
+        assert!(!mock_client.reentered(), "reentrant execute must not succeed");
+        // …and the proposal is executed exactly once.
+        assert!(ctx.client.get_proposal(&id).executed);
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 1);
+    }
+
+    #[test]
+    fn test_reentrant_execute_of_other_proposal_blocked() {
+        use soroban_sdk::xdr::ToXdr;
+        let ctx = Ctx::setup();
+        let mock_id = ctx.env.register_contract(None, ReentrantMock);
+        let mock_client = ReentrantMockClient::new(&ctx.env, &mock_id);
+        let executor = Address::generate(&ctx.env);
+        let new_admin = Address::generate(&ctx.env);
+
+        // Attack surface: dispatching proposal 0 makes the mock try to force
+        // proposal 1 through *before* the outer dispatch returns.
+        let id0 = ctx.client.propose(
+            &ctx.signer_a,
+            &mock_id,
+            &CallData::StreamSetAdmin(new_admin).to_xdr(&ctx.env),
+        );
+        let id1 = ctx.client.propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id0);
+        ctx.client.approve(&ctx.signer_b, &id0);
+        ctx.client.approve(&ctx.signer_a, &id1);
+        ctx.client.approve(&ctx.signer_b, &id1);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+
+        // The mock re-enters with the *other* (not yet executed) proposal.
+        mock_client.arm(&ctx.contract_id, &executor, &id1);
+
+        let result = ctx.client.try_execute(&executor, &id0);
+        assert!(result.is_ok(), "legit execution must succeed");
+        assert!(
+            mock_client.guard_blocked(),
+            "reentrant execute of another proposal must be rejected by the guard"
+        );
+        assert!(!mock_client.reentered());
+
+        // Proposal 0 executed exactly once; proposal 1 left untouched.
+        assert!(ctx.client.get_proposal(&id0).executed);
+        assert!(
+            !ctx.client.get_proposal(&id1).executed,
+            "the guard must prevent a second proposal from being pushed through reentrancy"
+        );
+        assert_eq!(executed_event_count(&ctx.env, &ctx.contract_id), 1);
     }
 }
