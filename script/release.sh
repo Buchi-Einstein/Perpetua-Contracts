@@ -47,7 +47,10 @@ cd "$(dirname "$0")/.."
 
 say() { printf '\n\033[1m── %s\033[0m\n' "$*"; }
 
-say "1. build the product artifact only"
+say "1. verify the pinned Rust toolchain"
+python3 script/verify_rust_version.py
+
+say "2. build the product artifact only"
 (
   cd "$STREAM_DIR"
   cargo build --target "$TARGET" --profile "$PROFILE"
@@ -56,7 +59,7 @@ say "1. build the product artifact only"
 OUT="$STREAM_DIR/target/$TARGET/$PROFILE"
 PRODUCT="$OUT/$PRODUCT_WASM"
 
-say "2. verify only the product artifact is present"
+say "3. verify only the product artifact is present"
 if [[ ! -f "$PRODUCT" ]]; then
   echo "   ✗ product artifact missing: $PRODUCT" >&2
   exit 1
