@@ -67,7 +67,10 @@ pub use accrual::{
     cliff_reached, duration, elapsed, liability, refundable, stream_time, vested, withdrawable,
 };
 pub use error::Error;
-pub use storage::{MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS};
+pub use storage::{
+    LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR, LEDGER_DRIFT_SAFETY_MULTIPLIER_NUMERATOR,
+    MIN_STREAM_TTL_LEDGERS, SECONDS_PER_LEDGER, TTL_BUFFER_SECONDS,
+};
 pub use types::op;
 pub use types::{DataKey, DelegateGrant, Stream, StreamStatus};
 
@@ -317,7 +320,7 @@ impl FluxoraStream {
         )?;
 
         storage::save_stream(&env, stream_id, &stream);
-        storage::extend_instance(&env);
+        Self::bump_instance_ttl(&env);
 
         events::stream_created(&env, stream_id, &stream);
         Ok(stream_id)
@@ -438,6 +441,7 @@ impl FluxoraStream {
         stream.deposited = new_deposited;
         stream.end_time = new_end;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::topped_up(&env, stream_id, &stream, amount);
         Ok(())
@@ -645,6 +649,7 @@ impl FluxoraStream {
         let token = stream.token.clone();
         let sender = stream.sender.clone();
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         if refund > 0 {
             token_transfer(
@@ -690,6 +695,7 @@ impl FluxoraStream {
         stream.paused_at = Some(now);
         stream.status = StreamStatus::Paused;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::paused(&env, stream_id, &stream, now);
         Ok(())
@@ -723,6 +729,7 @@ impl FluxoraStream {
         stream.paused_at = None;
         stream.status = StreamStatus::Active;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::resumed(&env, stream_id, &stream, paused_duration);
         Ok(())
@@ -776,6 +783,7 @@ impl FluxoraStream {
 
         stream.recipient = new_recipient.clone();
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::recipient_transferred(&env, stream_id, &old_recipient, &new_recipient);
         Ok(())
@@ -850,6 +858,7 @@ impl FluxoraStream {
             events::recipient_transferred(&env, stream_id, &old_recipient, &new_recipient);
             transferred += 1;
         }
+        Self::bump_instance_ttl(&env);
 
         Ok(transferred)
     }
@@ -922,6 +931,7 @@ impl FluxoraStream {
 
         let grant = DelegateGrant { ops, expires_at };
         storage::save_delegate(&env, stream_id, &delegate, &grant);
+        Self::bump_instance_ttl(&env);
 
         events::delegate_granted(&env, stream_id, &grantor, &delegate, ops, expires_at);
         Ok(())
@@ -955,6 +965,7 @@ impl FluxoraStream {
         grantor.require_auth_for_args((stream_id, delegate.clone()).into_val(&env));
 
         storage::remove_delegate(&env, stream_id, &delegate);
+        Self::bump_instance_ttl(&env);
         events::delegate_revoked(&env, stream_id, &grantor, &delegate);
         Ok(())
     }
@@ -1023,6 +1034,7 @@ impl FluxoraStream {
         let token = stream.token.clone();
         let sender = stream.sender.clone();
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         if refund > 0 {
             token_transfer(
@@ -1060,6 +1072,7 @@ impl FluxoraStream {
         stream.paused_at = Some(now);
         stream.status = StreamStatus::Paused;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::paused(&env, stream_id, &stream, now);
         Ok(())
@@ -1091,6 +1104,7 @@ impl FluxoraStream {
         stream.paused_at = None;
         stream.status = StreamStatus::Active;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::resumed(&env, stream_id, &stream, paused_duration);
         Ok(())
@@ -1157,6 +1171,7 @@ impl FluxoraStream {
         stream.deposited = new_deposited;
         stream.end_time = new_end;
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         // Tokens come from the sender — require their auth even though a
         // delegate triggered this call.
@@ -1203,6 +1218,7 @@ impl FluxoraStream {
 
         stream.recipient = new_recipient.clone();
         storage::save_stream(&env, stream_id, &stream);
+        Self::bump_instance_ttl(&env);
 
         events::recipient_transferred(&env, stream_id, &old_recipient, &new_recipient);
         Ok(())
@@ -1313,13 +1329,32 @@ impl FluxoraStream {
 
         let now = env.ledger().timestamp();
         let mut extended = 0u32;
+        let max_ttl = env.storage().max_ttl();
+
         for stream_id in stream_ids.iter() {
-            if let Ok(stream) = storage::peek_stream(&env, stream_id) {
-                let target = storage::ttl_target_ledgers_at(&env, &stream, now);
-                storage::extend_stream(&env, stream_id, &stream);
-                events::ttl_extended(&env, stream_id, target);
-                extended += 1;
+            let key = DataKey::Stream(stream_id);
+            if !env.storage().persistent().has(&key) {
+                continue;
             }
+
+            let current_ttl = env.storage().persistent().get_ttl(&key);
+            if current_ttl >= max_ttl {
+                continue;
+            }
+
+            let stream = storage::peek_stream(&env, stream_id)?;
+            let target = storage::ttl_target_ledgers_at(&env, &stream, now);
+
+            // If the entry is already funded for the target window, skip the
+            // decode-and-rewrite path entirely. This avoids redundant reads and
+            // keeps the keeper loop focused on streams that still need rent.
+            if current_ttl >= target {
+                continue;
+            }
+
+            env.storage().persistent().extend_ttl(&key, target, target);
+            events::ttl_extended(&env, stream_id, target);
+            extended += 1;
         }
         storage::extend_instance(&env);
         Ok(extended)
@@ -1394,6 +1429,12 @@ impl FluxoraStream {
         Ok(())
     }
 
+    /// Extend the instance TTL to the host maximum so the next-stream counter
+    /// never expires on a mutating invocation.
+    fn bump_instance_ttl(env: &Env) {
+        storage::extend_instance(env);
+    }
+
     /// Shared tail of [`withdraw`](Self::withdraw) and
     /// [`batch_withdraw`](Self::batch_withdraw): update accounting, persist,
     /// pay out, emit.
@@ -1454,6 +1495,7 @@ impl FluxoraStream {
         let token = stream.token.clone();
         let recipient = stream.recipient.clone();
         storage::save_stream(env, stream_id, stream);
+        Self::bump_instance_ttl(env);
 
         token_transfer(
             env,

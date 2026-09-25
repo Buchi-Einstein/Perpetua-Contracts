@@ -310,6 +310,14 @@ view calls combined into one derived figure (for example checking
 
 **2. Handle archived streams.** `stream_exists(id) == false` while
 `id < stream_count()` means the entry has been archived, not that it never
-existed. Surface a restore action rather than an error. See
-[KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) §1.
+existed. Surface a restore action rather than an error. The recovery workflow is:
+
+1. Check `stream_count()` and `stream_exists(id)` in one ledger snapshot.
+2. If `!stream_exists(id)` and `id < stream_count()`, treat it as archived.
+3. Tell the user the stream is archived and show a restore action.
+4. Re-submit the read or mutating call with a `RestoreFootprint` so the
+   persistent entry is recovered before retrying.
+5. After the restore succeeds, re-run the call and continue normally.
+
+See [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) §1.
 
