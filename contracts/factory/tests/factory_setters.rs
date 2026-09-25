@@ -11,6 +11,7 @@ use fluxora_factory::{
     FluxoraFactoryClient,
 };
 use soroban_sdk::{
+    contract, contractimpl,
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     Address, BytesN, Env, IntoVal,
 };
@@ -721,6 +722,8 @@ fn test_load_policy_reflects_initial_state() {
         policy.max_rate_per_second, None,
         "no rate bounds by default"
     );
+    assert_eq!(policy.max_active_streams, u32::MAX);
+    assert_eq!(policy.active_streams, 0);
 }
 
 /// Applying each policy setter (cap / min_duration / stream_contract /
@@ -883,6 +886,91 @@ fn test_load_policy_equality_is_struct_equality() {
     let mut different = p1.clone();
     different.max_deposit += 1;
     assert_ne!(p1, different);
+}
+
+// ---------------------------------------------------------------------------
+// Active-stream capacity
+// ---------------------------------------------------------------------------
+
+#[test]
+fn active_stream_cap_blocks_creation_until_terminal_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stream_id = env.register_contract(None, StreamStub);
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    factory.init(&admin, &stream_id, &10_000, &100);
+    factory.set_max_active_streams(&1);
+
+    factory.create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &1_000,
+        &0,
+        &100,
+        &0,
+        &true,
+        &true,
+        &true,
+    );
+    assert_eq!(factory.get_factory_config().active_streams, 1);
+
+    assert_eq!(
+        factory
+            .try_create_stream(
+                &sender,
+                &recipient,
+                &token,
+                &1_000,
+                &0,
+                &100,
+                &0,
+                &true,
+                &true,
+                &true,
+            )
+            .unwrap_err()
+            .unwrap(),
+        FactoryError::CapacityCapExceeded
+    );
+
+    factory.stream_terminated(&0);
+    assert_eq!(factory.get_factory_config().active_streams, 0);
+    factory.create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &1_000,
+        &0,
+        &100,
+        &0,
+        &true,
+        &true,
+        &true,
+    );
+}
+
+#[test]
+fn max_active_streams_is_admin_configurable() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let fid = env.register_contract(None, FluxoraFactory);
+    let factory = FluxoraFactoryClient::new(&env, &fid);
+    let admin = Address::generate(&env);
+    let stream_contract = Address::generate(&env);
+
+    factory.init(&admin, &stream_contract, &10_000, &100);
+    factory.set_max_active_streams(&25);
+
+    let config = factory.get_factory_config();
+    assert_eq!(config.max_active_streams, 25);
+    assert_eq!(config.active_streams, 0);
 }
 
 // ---------------------------------------------------------------------------
