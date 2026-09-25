@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, xdr::FromXdr, Address,
-    Bytes, Env, IntoVal, Map, Symbol, Vec,
+    Bytes, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,22 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Lifecycle state of a governance proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Created, but no signer has approved it yet.
+    Proposed,
+    /// At least one signer has approved it, but quorum has not been reached.
+    Approved,
+    /// Quorum has been reached and the proposal is waiting for its timelock.
+    Queued,
+    /// The proposal was executed successfully.
+    Executed,
+    /// The proposal was cancelled and is permanently terminal.
+    Cancelled,
+}
+
 /// Persistent record of a governance proposal.
 ///
 /// `calldata` is stored as an opaque `Bytes` payload whose interpretation is
@@ -61,8 +77,8 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
-    /// Earliest ledger timestamp at which this proposal may execute; zero until quorum.
-    pub eta: u64,
+    /// Authoritative lifecycle state.
+    pub status: ProposalStatus,
     /// True once `execute` has been called successfully.
     pub executed: bool,
     /// True once `cancel_proposal` has been called. Terminal — no further
@@ -117,6 +133,8 @@ pub enum GovernanceError {
     CalldataEmpty = 19,
     /// Proposal calldata failed to decode into a known `CallData` variant.
     InvalidCalldata = 20,
+    /// The requested operation is not legal for the proposal's current state.
+    InvalidProposalState = 21,
 }
 
 /// Storage keys for the governance contract.
@@ -184,6 +202,8 @@ pub enum CallData {
     FactorySetAllowlist(Address, bool),
     /// `set_stream_contract(new_stream_contract)`
     FactorySetStreamContract(Address),
+    /// `set_stream_wasm_hash(reviewed_wasm_hash)`
+    FactorySetStreamWasmHash(BytesN<32>),
 }
 
 /// Decode `calldata` bytes into a `CallData` variant and invoke the target.
@@ -249,6 +269,13 @@ fn dispatch_call(env: &Env, target: &Address, calldata: &Bytes) -> Result<(), Go
                 target,
                 &Symbol::new(env, "set_stream_contract"),
                 (new_contract,).into_val(env),
+            );
+        }
+        CallData::FactorySetStreamWasmHash(new_hash) => {
+            env.invoke_contract::<()>(
+                target,
+                &Symbol::new(env, "set_stream_wasm_hash"),
+                (new_hash,).into_val(env),
             );
         }
     }
@@ -838,7 +865,7 @@ impl FluxoraGovernance {
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
             created_at: now,
-            eta: 0,
+            status: ProposalStatus::Proposed,
             executed: false,
             cancelled: false,
         };
@@ -886,11 +913,11 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
-        }
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
+        match proposal.status {
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Queued => return Err(GovernanceError::InvalidProposalState),
+            ProposalStatus::Proposed | ProposalStatus::Approved => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -912,9 +939,10 @@ impl FluxoraGovernance {
         let quorum_reached = if approval_count == threshold {
             let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
-            proposal.eta = executable_after;
+            proposal.status = ProposalStatus::Queued;
             Some((now, executable_after))
         } else {
+            proposal.status = ProposalStatus::Approved;
             None
         };
 
@@ -987,11 +1015,13 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
-        }
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
+        match proposal.status {
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Proposed | ProposalStatus::Approved => {
+                return Err(GovernanceError::QuorumNotReached)
+            }
+            ProposalStatus::Queued => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -1026,6 +1056,7 @@ impl FluxoraGovernance {
         }
 
         // CEI: mark as executed before emitting the event.
+        proposal.status = ProposalStatus::Executed;
         proposal.executed = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
@@ -1075,11 +1106,10 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
-        }
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
+        match proposal.status {
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Proposed | ProposalStatus::Approved | ProposalStatus::Queued => {}
         }
 
         // Only the original proposer or the admin may cancel.
@@ -1088,6 +1118,7 @@ impl FluxoraGovernance {
             return Err(GovernanceError::NotProposerOrAdmin);
         }
 
+        proposal.status = ProposalStatus::Cancelled;
         proposal.cancelled = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
@@ -1112,9 +1143,21 @@ impl FluxoraGovernance {
         load_proposal(&env, proposal_id)
     }
 
-    /// Return the proposal-level execution timestamp (`eta`).
-    pub fn get_proposal_eta(env: Env, proposal_id: u32) -> Result<u64, GovernanceError> {
-        Ok(load_proposal(&env, proposal_id)?.eta)
+    /// Return the current lifecycle state of a proposal.
+    pub fn get_proposal_status(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.status)
+    }
+
+    /// Return whether a proposal is currently in the requested lifecycle state.
+    pub fn is_proposal_in_status(
+        env: Env,
+        proposal_id: u32,
+        expected: ProposalStatus,
+    ) -> Result<bool, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.status == expected)
     }
 
     /// Return the number of proposals created so far.
@@ -1221,11 +1264,10 @@ impl FluxoraGovernance {
     pub fn is_executable(env: Env, proposal_id: u32) -> Result<bool, GovernanceError> {
         let proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Ok(false);
-        }
-        if proposal.executed {
-            return Ok(false);
+        match proposal.status {
+            ProposalStatus::Cancelled | ProposalStatus::Executed => return Ok(false),
+            ProposalStatus::Proposed | ProposalStatus::Approved => return Ok(false),
+            ProposalStatus::Queued => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -1560,6 +1602,91 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Cross-contract dispatch — governance driving factory policy (#38)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_governance_executes_factory_policy_update_cross_contract() {
+        use soroban_sdk::xdr::ToXdr;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        // Governance contract: 3 signers, threshold 2.
+        let gov_id = env.register(FluxoraGovernance, ());
+        let gov = FluxoraGovernanceClient::new(&env, &gov_id);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        gov.init(
+            &admin,
+            &vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+            &2u32,
+        );
+
+        // Factory contract whose admin is the governance contract.
+        let factory_id = env.register(fluxora_factory::FluxoraFactory, ());
+        let factory = fluxora_factory::FluxoraFactoryClient::new(&env, &factory_id);
+        let stream_contract = Address::generate(&env);
+        factory.init(&gov_id, &stream_contract, &10_000, &100);
+        assert_eq!(factory.get_factory_config().max_deposit, 10_000);
+
+        // Queue a governed `FactorySetCap(42)` proposal targeted at the factory
+        // and drive it through the full multi-sig lifecycle in the test host.
+        let calldata = CallData::FactorySetCap(42).to_xdr(&env);
+        let id = gov.propose(&signer_a, &factory_id, &calldata);
+        gov.approve(&signer_a, &id);
+        gov.approve(&signer_b, &id);
+
+        env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&env);
+        gov.execute(&executor, &id);
+
+        // The cross-contract dispatch reached the factory and applied the
+        // policy update; execution is recorded on the proposal.
+        assert_eq!(factory.get_factory_config().max_deposit, 42);
+        assert!(gov.get_proposal(&id).executed);
+    }
+
+    #[test]
+    fn test_governance_rotates_factory_admin_cross_contract() {
+        use soroban_sdk::xdr::ToXdr;
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000_000);
+
+        let gov_id = env.register(FluxoraGovernance, ());
+        let gov = FluxoraGovernanceClient::new(&env, &gov_id);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        gov.init(
+            &admin,
+            &vec![&env, signer_a.clone(), signer_b.clone(), signer_c.clone()],
+            &2u32,
+        );
+
+        let factory_id = env.register(fluxora_factory::FluxoraFactory, ());
+        let factory = fluxora_factory::FluxoraFactoryClient::new(&env, &factory_id);
+        let stream_contract = Address::generate(&env);
+        factory.init(&gov_id, &stream_contract, &10_000, &100);
+
+        // Governance rotates the factory admin via the generic dispatch path.
+        let new_admin = Address::generate(&env);
+        let calldata = CallData::FactorySetAdmin(new_admin.clone()).to_xdr(&env);
+        let id = gov.propose(&signer_a, &factory_id, &calldata);
+        gov.approve(&signer_a, &id);
+        gov.approve(&signer_b, &id);
+        env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&env);
+        gov.execute(&executor, &id);
+
+        assert_eq!(factory.get_factory_config().admin, new_admin);
+    }
+
     #[test]
     fn test_quorum_and_timelock_constants() {
         let ctx = Ctx::setup();
@@ -1769,6 +1896,102 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // update_threshold — dynamic threshold updates (issue #42)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_threshold_updates_value_and_emits_event() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        ctx.client.update_threshold(&3u32);
+
+        let (topic, data) = last_contract_event(&ctx.env, &ctx.contract_id);
+        assert_eq!(ctx.client.quorum(), 3);
+        assert_eq!(topic, symbol_short!("quor_cfg"));
+        let payload = QuorumConfig::try_from_val(&ctx.env, &data).expect("decodes to QuorumConfig");
+        assert_eq!(payload.threshold, 3);
+        assert_eq!(payload.signer_count, 3);
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_zero() {
+        let ctx = Ctx::setup();
+        let events_before = ctx.env.events().all().events().len();
+
+        let result = ctx.client.try_update_threshold(&0u32);
+
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
+    }
+
+    #[test]
+    fn test_update_threshold_rejects_above_signer_count() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        let events_before = ctx.env.events().all().events().len();
+
+        let result = ctx.client.try_update_threshold(&4u32);
+
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+        assert_eq!(ctx.env.events().all().events().len(), events_before);
+    }
+
+    #[test]
+    fn test_update_threshold_accepts_one() {
+        let ctx = Ctx::setup();
+
+        ctx.client.update_threshold(&1u32);
+
+        assert_eq!(ctx.client.quorum(), 1);
+    }
+
+    #[test]
+    fn test_update_threshold_accepts_valid_range() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        ctx.client.update_threshold(&1u32);
+        assert_eq!(ctx.client.quorum(), 1);
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+        ctx.client.update_threshold(&2u32);
+        assert_eq!(ctx.client.quorum(), 2);
+    }
+
+    #[test]
+    fn test_update_threshold_requires_admin_auth() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let signer_c = Address::generate(&env);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        client.init(&admin, &vec![&env, signer_a, signer_b, signer_c], &2u32);
+
+        // No mock_all_auths: require_auth() on the admin address fails at the
+        // host level, so the threshold must remain untouched.
+        let result = client.try_update_threshold(&3u32);
+        assert!(
+            result.is_err(),
+            "update_threshold should abort without admin auth"
+        );
+        assert_eq!(client.quorum(), 2);
+    }
+
+    #[test]
+    fn test_update_threshold_after_signer_removal_respects_current_count() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+        ctx.client.remove_signer(&ctx.signer_c); // Now 2 signers
+        ctx.client.update_threshold(&2u32);
+        assert_eq!(ctx.client.quorum(), 2);
+        // 3 > 2 remaining signers — must be rejected.
+        let result = ctx.client.try_update_threshold(&3u32);
+        assert_eq!(result, Err(Ok(GovernanceError::InvalidThreshold)));
+        assert_eq!(ctx.client.quorum(), 2);
+    }
+
+    // -----------------------------------------------------------------------
     // Quorum invariant on remove_signer
     // -----------------------------------------------------------------------
 
@@ -1832,9 +2055,68 @@ mod tests {
         let p = ctx.client.get_proposal(&id);
         assert_eq!(p.proposer, ctx.signer_a);
         assert_eq!(p.target, target);
+        assert_eq!(p.status, ProposalStatus::Proposed);
         assert!(!p.executed);
         assert!(!p.cancelled);
         assert_eq!(p.approvals.len(), 0);
+    }
+
+    #[test]
+    fn test_proposal_status_lifecycle_and_illegal_transitions() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("lifecycle"));
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Proposed);
+        assert!(ctx.client.is_proposal_in_status(&id, &ProposalStatus::Proposed));
+
+        ctx.client.approve(&ctx.signer_a, &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Approved);
+
+        ctx.client.approve(&ctx.signer_b, &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Queued);
+        assert_eq!(
+            ctx.client.try_approve(&ctx.signer_c, &id),
+            Err(Ok(GovernanceError::InvalidProposalState))
+        );
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Executed);
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::AlreadyExecuted))
+        );
+
+        let cancelled_id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("cancel"));
+        ctx.client.cancel_proposal(&ctx.signer_a, &cancelled_id);
+        assert_eq!(
+            ctx.client.get_proposal_status(&cancelled_id),
+            ProposalStatus::Cancelled
+        );
+        assert_eq!(
+            ctx.client.try_approve(&ctx.signer_b, &cancelled_id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &cancelled_id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+    }
+
+    #[test]
+    fn test_status_helpers_reject_unknown_proposal() {
+        let ctx = Ctx::setup();
+        assert_eq!(
+            ctx.client.try_get_proposal_status(&99),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            ctx.client.try_is_proposal_in_status(&99, &ProposalStatus::Proposed),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
     }
 
     #[test]
@@ -2139,6 +2421,73 @@ mod tests {
         let p = ctx.client.get_proposal(&id);
         assert!(p.executed);
         assert_eq!(p.target, target);
+    }
+
+    /// End-to-end multi-sig threshold update flow (issue #42): the admin moves
+    /// the approval threshold from 2-of-3 to 3-of-3, and a proposal submitted
+    /// *after* the change requires the new threshold before it can execute.
+    #[test]
+    fn test_threshold_update_enforced_end_to_end() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        // Admin raises the threshold before the new proposal is queued.
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+
+        let target = ctx.dummy_target();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &target, &ctx.calldata("post-update"));
+
+        // Two approvals no longer reach the new 3-of-3 threshold.
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert_eq!(p.approvals.len(), 2);
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        let result = ctx.client.try_execute(&executor, &id);
+        assert_eq!(result, Err(Ok(GovernanceError::QuorumNotReached)));
+
+        // The third signer brings the proposal to quorum under the new threshold.
+        ctx.client.approve(&ctx.signer_c, &id);
+        // Quorum was only reached once the third vote landed, so the timelock
+        // clock starts from that moment, not from the earlier warp.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK * 2 + 1);
+        ctx.client.execute(&executor, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert!(p.executed);
+    }
+
+    /// In-flight proposals snapshot the threshold at quorum time: a proposal
+    /// that reached 2-of-3 quorum before the admin raised the threshold to 3
+    /// remains executable, because the change cannot rewrite history.
+    #[test]
+    fn test_threshold_change_does_not_retroactively_invalidate_quorum() {
+        let ctx = Ctx::setup(); // 3 signers, threshold=2
+
+        let id = ctx.client.propose(
+            &ctx.signer_a,
+            &ctx.dummy_target(),
+            &ctx.calldata("pre-update"),
+        );
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id); // quorum reached at threshold 2
+
+        // Admin raises the threshold afterwards — precisely the race the
+        // QuorumInfo snapshot guard exists for.
+        ctx.client.update_threshold(&3u32);
+        assert_eq!(ctx.client.quorum(), 3);
+
+        let quorum_info = ctx.client.get_quorum_info(&id).unwrap();
+        assert_eq!(quorum_info.threshold, 2); // snapshot, not the live value
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        ctx.client.execute(&executor, &id);
+        let p = ctx.client.get_proposal(&id);
+        assert!(p.executed);
     }
 
     #[test]

@@ -119,7 +119,11 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 11 | `StreamNotActive` | | 24 | `StreamIdExhausted` |
 | 12 | `StreamNotPaused` | | 25 | `TokenTransferFailed` |
 | 13 | `StreamAlreadyPaused` | | 26 | `TokenMissing` |
+| | | | 27 | `DelegateNotPermitted` |
+| | | | 28 | `DelegateExpired` |
 | | | | 29 | `MalformedStreamId` |
+| | | | 30 | `RepeatedTransfer` |
+| | | | 31 | `InvalidTopUp` |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
@@ -187,6 +191,8 @@ is the snake_case event name, second is always `stream_id`.
 |---|---|---|
 | `stream_created` | `stream_id`, `sender`, `recipient` | `token`, `deposited`, `start_time`, `end_time`, `cliff_time`, `cancellable`, `pausable`, `transferable` |
 | `withdrawn` | `stream_id`, `recipient` | `amount`, `withdrawn`, `deposited`, `status` |
+
+`stream_created` is the bootstrap event indexers use to reconstruct a stream's initial state. It is the only source of the per-stream metadata needed to build a sender/recipient mapping before any later lifecycle event arrives.
 | `cancelled` | `stream_id`, `sender`, `recipient` | `refunded`, `vested`, `withdrawn`, `end_time` |
 | `paused` | `stream_id`, `sender` | `paused_at`, `paused_total` |
 | `resumed` | `stream_id`, `sender` | `paused_duration`, `paused_total` |
