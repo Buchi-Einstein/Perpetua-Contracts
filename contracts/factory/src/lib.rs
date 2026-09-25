@@ -47,11 +47,12 @@ const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
 
 /// Storage keys.
 #[contracttype]
+#[repr(u32)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// The single persistent policy record, written by `init` and rewritten by
     /// every setter.
-    Config,
+    Config = 0,
     /// Presence of an address under this key means it is allowlisted.
     Allowlist(Address),
     /// The proposed next admin for the two-step rotation hand-off. Written by

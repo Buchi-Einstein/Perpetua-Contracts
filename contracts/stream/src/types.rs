@@ -155,17 +155,18 @@ impl Stream {
 /// There is no `Config` key: with no admin, no fees and no upgradeability
 /// (all explicit non-goals), the contract has nothing to configure.
 #[contracttype]
+#[repr(u32)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Instance storage. Monotonic counter, next id to hand out.
     /// Incremented only on successful stream creation.
-    NextStreamId,
+    NextStreamId = 0,
     /// Instance storage. Number of streams successfully created.
     /// Incremented only in the same transaction as `NextStreamId` and the
     /// corresponding `Stream(id)` entry.
-    StreamCount,
+    StreamCount = 1,
     /// Persistent storage. One entry per stream.
-    Stream(u64),
+    Stream(u64) = 2,
     /// Persistent storage. One entry per (stream_id, delegate) pair.
-    Delegate(u64, Address),
+    Delegate(u64, Address) = 3,
 }
