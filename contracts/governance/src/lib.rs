@@ -117,23 +117,24 @@ pub enum GovernanceError {
 
 /// Storage keys for the governance contract.
 #[contracttype]
+#[repr(u32)]
 pub enum DataKey {
     /// Admin address (instance storage).
-    Admin,
+    Admin = 0,
     /// Registered co-signers list (instance storage).
-    Signers,
+    Signers = 1,
     /// Minimum approval threshold (instance storage).
-    Threshold,
+    Threshold = 2,
     /// Monotonic proposal ID counter (instance storage).
-    NextProposalId,
+    NextProposalId = 3,
     /// Persistent record for a proposal (persistent storage, keyed by ID).
-    Proposal(u32),
+    Proposal(u32) = 4,
     /// Ledger timestamp at which a proposal first reached quorum (persistent).
-    QuorumReachedAt(u32),
+    QuorumReachedAt(u32) = 5,
     /// Map<Address, bool> membership index for O(1) signer lookups (instance storage).
-    SignerIndex,
+    SignerIndex = 6,
     /// Per-proposal Map<Address, bool> for O(1) duplicate-approval detection (persistent).
-    ProposalApprovalIdx(u32),
+    ProposalApprovalIdx(u32) = 7,
 }
 
 // ---------------------------------------------------------------------------
