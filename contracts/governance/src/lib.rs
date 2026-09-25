@@ -260,13 +260,33 @@ const PERSISTENT_BUMP_AMOUNT: u32 = 120_960;
 // Events
 // ---------------------------------------------------------------------------
 
-/// Emitted when a new proposal is submitted.
+/// Standardised audit-log schema for the governance lifecycle (#49).
+///
+/// Every lifecycle action emits a structured event whose **topics** carry the
+/// indexer-friendly filter keys — event name, `proposal_id` and the acting
+/// participant — and whose **data** payload carries the full schema including
+/// targets and timestamps:
+///
+/// | Action          | Topic                                        | Data                                |
+/// |-----------------|----------------------------------------------|-------------------------------------|
+/// | propose         | `("proposal_created",  id, proposer)`        | `ProposalCreated`   (with target)   |
+/// | approve         | `("vote_cast",       id, voter)`             | `VoteCast`          (count + ts)    |
+/// | quorum reached  | `("proposal_queued", id)`                    | `ProposalQueued`    (timestamps)    |
+/// | execute         | `("proposal_executed", id, executor)`        | `ProposalExecuted`  (with target)   |
+/// | cancel          | `("proposal_cancelled", id, canceller)`      | `ProposalCancelled` (timestamp)     |
+///
+/// `proposal_id` is always the second topic element so indexers can filter the
+/// full lifecycle of a single proposal with a single topic subscription.
+
+/// Event: a new proposal was submitted (topic `proposal_created`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCreated {
     pub proposal_id: u32,
     pub proposer: Address,
     pub target: Address,
+    /// Ledger timestamp at which the proposal was submitted.
+    pub created_at: u64,
 }
 
 /// Records the timestamp and effective threshold when quorum was first reached.
@@ -279,33 +299,42 @@ pub struct QuorumInfo {
     pub threshold: u32,
 }
 
-/// Emitted when a co-signer approves a proposal.
+/// Event: a registered signer cast a vote (topic `vote_cast`).
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct ProposalApproved {
+pub struct VoteCast {
     pub proposal_id: u32,
-    pub approver: Address,
+    pub voter: Address,
+    /// Total headcount of approvals so far (including this vote).
     pub approval_count: u32,
+    /// Ledger timestamp at which the vote was cast.
+    pub timestamp: u64,
 }
 
-/// Emitted when quorum is first reached for a proposal, starting the timelock.
+/// Event: a proposal first reached quorum and was queued, starting the timelock
+/// (topic `proposal_queued`).
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct QuorumReached {
+pub struct ProposalQueued {
     pub proposal_id: u32,
     pub quorum_reached_at: u64,
+    /// `quorum_reached_at + GOVERNANCE_TIMELOCK_SECONDS` — earliest execution time.
     pub executable_after: u64,
+    /// The threshold snapshot used for this quorum decision.
+    pub threshold: u32,
 }
 
-/// Emitted when a proposal is cancelled by the proposer or admin.
+/// Event: a proposal was cancelled by the proposer or admin (topic `proposal_cancelled`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalCancelled {
     pub proposal_id: u32,
     pub canceller: Address,
+    /// Ledger timestamp at which the proposal was cancelled.
+    pub cancelled_at: u64,
 }
 
-/// Emitted when a proposal is executed after quorum and timelock.
+/// Event: a proposal was executed after quorum and timelock (topic `proposal_executed`).
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct ProposalExecuted {
@@ -313,6 +342,8 @@ pub struct ProposalExecuted {
     pub executor: Address,
     pub target: Address,
     pub calldata: Bytes,
+    /// Ledger timestamp at which the proposal was executed.
+    pub executed_at: u64,
 }
 
 /// Emitted when the admin adds a new co-signer to the governance set.
@@ -842,11 +873,12 @@ impl FluxoraGovernance {
         bump_instance(&env);
 
         env.events().publish(
-            (symbol_short!("proposed"), id),
+            (symbol_short!("proposal_created"), id, proposer.clone()),
             ProposalCreated {
                 proposal_id: id,
                 proposer,
                 target,
+                created_at: now,
             },
         );
 
@@ -904,8 +936,8 @@ impl FluxoraGovernance {
         let approval_count = proposal.approvals.len();
 
         let threshold = get_threshold(&env)?;
+        let now = env.ledger().timestamp();
         let quorum_reached = if approval_count == threshold {
-            let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             Some((now, executable_after))
         } else {
@@ -918,11 +950,12 @@ impl FluxoraGovernance {
         bump_instance(&env);
 
         env.events().publish(
-            (symbol_short!("approved"), proposal_id),
-            ProposalApproved {
+            (symbol_short!("vote_cast"), proposal_id, approver.clone()),
+            VoteCast {
                 proposal_id,
-                approver,
+                voter: approver,
                 approval_count,
+                timestamp: now,
             },
         );
 
@@ -945,11 +978,12 @@ impl FluxoraGovernance {
             bump_quorum_ttl(&env, proposal_id);
 
             env.events().publish(
-                (symbol_short!("quorum"), proposal_id),
-                QuorumReached {
+                (symbol_short!("proposal_queued"), proposal_id),
+                ProposalQueued {
                     proposal_id,
                     quorum_reached_at: now,
                     executable_after,
+                    threshold,
                 },
             );
         }
@@ -1028,12 +1062,13 @@ impl FluxoraGovernance {
         dispatch_call(&env, &proposal.target, &proposal.calldata)?;
 
         env.events().publish(
-            (symbol_short!("executed"), proposal_id),
+            (symbol_short!("proposal_executed"), proposal_id, executor.clone()),
             ProposalExecuted {
                 proposal_id,
                 executor,
                 target: proposal.target.clone(),
                 calldata: proposal.calldata.clone(),
+                executed_at: now,
             },
         );
 
@@ -1081,12 +1116,14 @@ impl FluxoraGovernance {
         proposal.cancelled = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
+        let now = env.ledger().timestamp();
 
         env.events().publish(
-            (symbol_short!("cancelled"), proposal_id),
+            (symbol_short!("proposal_cancelled"), proposal_id, caller.clone()),
             ProposalCancelled {
                 proposal_id,
                 canceller: caller,
+                cancelled_at: now,
             },
         );
 
@@ -2887,5 +2924,196 @@ mod tests {
             ctx.client.try_execute(&executor, &id3),
             Err(Ok(GovernanceError::ProposalExpired))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Governance event schema / audit logging (#49)
+    // -----------------------------------------------------------------------
+
+    /// Collect every event emitted by `contract_id`, grouped by topic symbol.
+    /// Returns `(topics, data)` for each event whose first topic is `sym`.
+    fn events_by_symbol(
+        env: &Env,
+        contract_id: &Address,
+        sym: &Symbol,
+    ) -> Vec<(soroban_sdk::Vec<Val>, Val)> {
+        use soroban_sdk::xdr::ContractEventBody;
+        let mut result = Vec::new(env);
+        for event in env
+            .events()
+            .all()
+            .filter_by_contract(contract_id)
+            .events()
+            .iter()
+        {
+            let ContractEventBody::V0(body) = &event.body;
+            if let Some(topic) = body.topics.first() {
+                let name = Symbol::try_from_val(env, &Val::try_from_val(env, topic).expect("topic"))
+                    .expect("event name topic");
+                if name == *sym {
+                    let mut topics = Vec::new(env);
+                    for t in body.topics.iter() {
+                        topics.push_back(Val::try_from_val(env, t).expect("topic val"));
+                    }
+                    let data = Val::try_from_val(env, &body.data).expect("data val");
+                    result.push_back((topics, data));
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_proposal_created_event_schema() {
+        let ctx = Ctx::setup();
+        let target = ctx.dummy_target();
+        let id = ctx.client.propose(&ctx.signer_a, &target, &ctx.calldata("x"));
+
+        let events = events_by_symbol(&ctx.env, &ctx.contract_id, &symbol_short!("proposal_created"));
+        assert_eq!(events.len(), 1, "exactly one proposal_created event");
+        let (topics, data) = &events.get(0).unwrap();
+
+        // Topics: (symbol, proposal_id, proposer).
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics.get(0), symbol_short!("proposal_created").into_val(&ctx.env));
+        assert_eq!(topics.get(1), id.into_val(&ctx.env));
+        assert_eq!(topics.get(2), ctx.signer_a.clone().into_val(&ctx.env));
+
+        // Data carries the full schema incl. target and created_at.
+        let decoded = ProposalCreated::try_from_val(&ctx.env, data).expect("decodes");
+        assert_eq!(decoded.proposal_id, id);
+        assert_eq!(decoded.proposer, ctx.signer_a);
+        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.created_at, 1_000_000);
+    }
+
+    #[test]
+    fn test_vote_cast_event_schema() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        let events = events_by_symbol(&ctx.env, &ctx.contract_id, &symbol_short!("vote_cast"));
+        assert_eq!(events.len(), 1, "exactly one vote_cast event");
+        let (topics, data) = &events.get(0).unwrap();
+
+        // Topics: (symbol, proposal_id, voter).
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics.get(1), id.into_val(&ctx.env));
+        assert_eq!(topics.get(2), ctx.signer_a.clone().into_val(&ctx.env));
+
+        let decoded = VoteCast::try_from_val(&ctx.env, data).expect("decodes");
+        assert_eq!(decoded.proposal_id, id);
+        assert_eq!(decoded.voter, ctx.signer_a);
+        assert_eq!(decoded.approval_count, 1);
+        assert_eq!(decoded.timestamp, 1_000_000);
+    }
+
+    #[test]
+    fn test_proposal_queued_event_schema() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+
+        let events = events_by_symbol(&ctx.env, &ctx.contract_id, &symbol_short!("proposal_queued"));
+        assert_eq!(events.len(), 1, "quorum fires exactly once");
+        let (topics, data) = &events.get(0).unwrap();
+
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(1), id.into_val(&ctx.env));
+
+        let decoded = ProposalQueued::try_from_val(&ctx.env, data).expect("decodes");
+        assert_eq!(decoded.proposal_id, id);
+        assert_eq!(decoded.quorum_reached_at, 1_000_000);
+        assert_eq!(decoded.executable_after, 1_000_000 + TIMELOCK);
+        assert_eq!(decoded.threshold, 2);
+    }
+
+    #[test]
+    fn test_proposal_executed_event_schema() {
+        let ctx = Ctx::setup();
+        let target = ctx.dummy_target();
+        let id = ctx.client.propose(&ctx.signer_a, &target, &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        ctx.client.execute(&executor, &id);
+
+        let events = events_by_symbol(&ctx.env, &ctx.contract_id, &symbol_short!("proposal_executed"));
+        assert_eq!(events.len(), 1, "exactly one proposal_executed event");
+        let (topics, data) = &events.get(0).unwrap();
+
+        // Topics: (symbol, proposal_id, executor).
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics.get(1), id.into_val(&ctx.env));
+        assert_eq!(topics.get(2), executor.clone().into_val(&ctx.env));
+
+        let decoded = ProposalExecuted::try_from_val(&ctx.env, data).expect("decodes");
+        assert_eq!(decoded.proposal_id, id);
+        assert_eq!(decoded.executor, executor);
+        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.calldata, ctx.calldata("x"));
+        assert_eq!(decoded.executed_at, 1_000_000 + TIMELOCK + 1);
+    }
+
+    #[test]
+    fn test_proposal_cancelled_event_schema() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.cancel_proposal(&ctx.signer_a, &id);
+
+        let events = events_by_symbol(&ctx.env, &ctx.contract_id, &symbol_short!("proposal_cancelled"));
+        assert_eq!(events.len(), 1, "exactly one proposal_cancelled event");
+        let (topics, data) = &events.get(0).unwrap();
+
+        // Topics: (symbol, proposal_id, canceller).
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics.get(1), id.into_val(&ctx.env));
+        assert_eq!(topics.get(2), ctx.signer_a.clone().into_val(&ctx.env));
+
+        let decoded = ProposalCancelled::try_from_val(&ctx.env, data).expect("decodes");
+        assert_eq!(decoded.proposal_id, id);
+        assert_eq!(decoded.canceller, ctx.signer_a);
+        assert_eq!(decoded.cancelled_at, 1_000_000);
+    }
+
+    #[test]
+    fn test_lifecycle_events_share_proposal_id_in_topics() {
+        // Indexer-friendly: `proposal_id` must be the second topic element of
+        // every lifecycle event so a single subscription covers the lifecycle.
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("x"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        ctx.client.approve(&ctx.signer_b, &id);
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+
+        for sym in [
+            symbol_short!("proposal_created"),
+            symbol_short!("vote_cast"),
+            symbol_short!("proposal_queued"),
+            symbol_short!("proposal_executed"),
+        ] {
+            let events = events_by_symbol(&ctx.env, &ctx.contract_id, &sym);
+            assert!(!events.is_empty(), "expect at least one {sym:?} event");
+            for (topics, _) in events.iter() {
+                assert_eq!(
+                    topics.get(1),
+                    id.into_val(&ctx.env),
+                    "{sym:?} topics[1] must be proposal_id"
+                );
+            }
+        }
     }
 }
