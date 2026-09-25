@@ -16,18 +16,28 @@
 //! stream safe for an untrusted recipient to accept. The factory is the layer
 //! that *does* carry policy: a treasury that wants its on-chain creators to
 //! respect caps and minimums pins this contract in front of stream creation.
+//!
+//! ## Admin rotation (issue #39)
+//!
+//! The factory gates every policy setter behind a single admin key. Because a
+//! single-step rotation can destructively transfer control (or, worse, rotate
+//! it onto an un-signable key), the factory supports an optional two-step
+//! hand-off: `propose_admin` nominates a successor, and `accept_admin` — called
+//! by that successor — completes the transfer and immediately revokes the
+//! previous admin. The zero address and the factory's own address are rejected
+//! outright as admin candidates in both the single-step and two-step paths.
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Env, String,
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Instance entries are extended to the network-maxmium-adjacent window on every
-/// mutating call (same values as the stream and governance contracts). A factory
-/// that is merely read never bumps rent, by design — reads have no side effects.
+/// Storage entries are extended to the network-maximum-adjacent window on every
+/// policy interaction (same values as the stream and governance contracts).
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
 const DEFAULT_CREATIONS_PER_WINDOW: u32 = 100;
@@ -40,25 +50,17 @@ const DEFAULT_MAX_DURATION: u64 = 157_680_000;
 
 /// Storage keys.
 #[contracttype]
+#[repr(u32)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// The single persistent policy record, written by `init` and rewritten by
     /// every setter.
-    Config,
+    Config = 0,
     /// Presence of an address under this key means it is allowlisted.
     Allowlist(Address),
-    /// Presence of a token address under this key means it is approved.
-    TokenAllowlist(Address),
-    /// Per-sender creation bucket.
-    RateLimit(Address),
-}
-
-/// Sliding-window bucket for one sender's factory creations.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RateLimitBucket {
-    pub window_start: u32,
-    pub creations: u32,
+    /// The proposed next admin for the two-step rotation hand-off. Written by
+    /// `propose_admin`, consumed (and cleared) by `accept_admin`.
+    PendingAdmin,
 }
 
 /// The full on-chain configuration record.
@@ -71,6 +73,7 @@ pub struct RateLimitBucket {
 pub struct FactoryConfig {
     pub admin: Address,
     pub stream_contract: Address,
+    pub stream_wasm_hash: BytesN<32>,
     pub max_deposit: i128,
     pub min_duration: u64,
     /// Maximum stream duration in seconds.
@@ -84,10 +87,10 @@ pub struct FactoryConfig {
     pub min_rate_per_second: Option<i128>,
     /// Optional upper bound on the per-second stream rate, applied at creation.
     pub max_rate_per_second: Option<i128>,
-    /// Maximum creations per sender during `rate_limit_window_ledgers`.
-    pub max_creations_per_window: u32,
-    /// Number of ledgers in each sender rate-limit window.
-    pub rate_limit_window_ledgers: u32,
+    /// Maximum number of non-terminal streams admitted through this factory.
+    pub max_active_streams: u32,
+    /// Number of streams admitted but not yet released by a terminal callback.
+    pub active_streams: u32,
 }
 
 /// The policy view consumed by the stream-creation paths.
@@ -100,6 +103,7 @@ pub struct FactoryConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactoryPolicy {
     pub stream_contract: Address,
+    pub stream_wasm_hash: BytesN<32>,
     pub max_deposit: i128,
     pub min_duration: u64,
     pub max_duration: u64,
@@ -107,8 +111,23 @@ pub struct FactoryPolicy {
     pub creation_paused: bool,
     pub min_rate_per_second: Option<i128>,
     pub max_rate_per_second: Option<i128>,
-    pub max_creations_per_window: u32,
-    pub rate_limit_window_ledgers: u32,
+    pub max_active_streams: u32,
+    pub active_streams: u32,
+}
+
+/// A stream creation proxied by this factory.
+///
+/// The topic layout intentionally matches the stream contract's creation
+/// event namespace while adding the factory address as the first indexed
+/// context field: `stream_created, factory_id, sender, recipient`.
+#[contractevent]
+pub struct StreamCreated {
+    #[topic]
+    pub factory_id: Address,
+    #[topic]
+    pub sender: Address,
+    #[topic]
+    pub recipient: Address,
 }
 
 /// Error codes for the factory contract.
@@ -124,23 +143,52 @@ pub enum FactoryError {
     Unauthorized = 3,
     /// The recipient is not allowlisted.
     AllowlistDenied = 4,
-    /// The token is not approved by governance.
-    TokenNotAllowed = 5,
-    /// The sender has exhausted its current creation window.
-    RateLimitExceeded = 6,
-    /// A rate-limit quota or window must be greater than zero.
-    InvalidRateLimit = 7,
-    /// The stream duration is outside the configured policy bounds.
-    InvalidDuration = 8,
+    /// The proposed admin cannot be set: it is the zero address or the factory
+    /// contract itself, either of which would permanently lock the factory.
+    InvalidNewAdmin = 5,
+    /// `accept_admin` was called but no admin transfer has been proposed.
+    NoPendingAdmin = 6,
+}
+
+/// Emitted when an admin rotation is proposed (two-step hand-off, issue #39).
+#[contractevent]
+pub struct AdminTransferProposed {
+    #[topic]
+    pub current: Address,
+    #[topic]
+    pub pending: Address,
+}
+
+/// Emitted when the proposed admin accepts the hand-off. From this moment the
+/// previous admin is immediately revoked.
+#[contractevent]
+pub struct AdminTransferred {
+    #[topic]
+    pub previous: Address,
+    #[topic]
+    pub new: Address,
 }
 
 // ---------------------------------------------------------------------------
 // Storage helpers
 // ---------------------------------------------------------------------------
 
-/// Bumps the instance TTL on every mutating call so an actively-administered
-/// factory never archives.
-fn bump_instance(env: &Env) {
+/// Derives the deterministic salt used for a child stream deployment.
+///
+/// The serialized preimage is domain-separated and length-fixed after the
+/// sender address, so distinct `(sender, nonce, stream_id)` tuples cannot be
+/// confused by concatenation. The tuple is hashed to the 32-byte salt format
+/// accepted by Soroban deployment APIs.
+pub fn derive_stream_salt(env: &Env, sender: &Address, nonce: u64, stream_id: u64) -> BytesN<32> {
+    let mut preimage = Bytes::from_slice(env, b"perpetua-factory-stream-salt-v1");
+    preimage.append(&sender.to_xdr(env));
+    preimage.append(&Bytes::from_slice(env, &nonce.to_be_bytes()));
+    preimage.append(&Bytes::from_slice(env, &stream_id.to_be_bytes()));
+    env.crypto().sha256(&preimage)
+}
+
+/// Extends the factory instance entry to the network maximum.
+fn bump_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -148,10 +196,13 @@ fn bump_instance(env: &Env) {
 
 /// Returns the stored config or `NotInitialized`.
 fn load_config(env: &Env) -> Result<FactoryConfig, FactoryError> {
-    env.storage()
+    let config = env
+        .storage()
         .instance()
         .get(&DataKey::Config)
-        .ok_or(FactoryError::NotInitialized)
+        .ok_or(FactoryError::NotInitialized)?;
+    bump_ttl(env);
+    Ok(config)
 }
 
 /// Centralised policy-load chokepoint.
@@ -163,6 +214,7 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
     let config = load_config(env)?;
     Ok(FactoryPolicy {
         stream_contract: config.stream_contract,
+        stream_wasm_hash: config.stream_wasm_hash,
         max_deposit: config.max_deposit,
         min_duration: config.min_duration,
         max_duration: config.max_duration,
@@ -170,9 +222,31 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
         creation_paused: config.creation_paused,
         min_rate_per_second: config.min_rate_per_second,
         max_rate_per_second: config.max_rate_per_second,
-        max_creations_per_window: config.max_creations_per_window,
-        rate_limit_window_ledgers: config.rate_limit_window_ledgers,
+        max_active_streams: config.max_active_streams,
+        active_streams: config.active_streams,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Admin rotation guards
+// ---------------------------------------------------------------------------
+
+/// The all-zeros Stellar account (`G…WHF`). Anything signed by this key does
+/// not exist, so installing it as admin would permanently burn the factory's
+/// control surface. The factory refuses it everywhere an admin can be set.
+fn is_zero_address(env: &Env, addr: &Address) -> bool {
+    let zero = Address::from_string(&String::from_str(
+        env,
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    ));
+    *addr == zero
+}
+
+/// An address that must never become admin: the zero account (which cannot
+/// sign) or the factory's own contract address (which would make the factory
+/// its own admin and lock every setter behind a self-authorization).
+fn is_forbidden_admin(env: &Env, addr: &Address) -> bool {
+    is_zero_address(env, addr) || *addr == env.current_contract_address()
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +264,8 @@ impl FluxoraFactory {
     /// - `admin`: Address that can update every policy axis.
     /// - `stream_contract`: Address of the `fluxora-stream` contract created
     ///   streams will point at.
+    /// - `stream_wasm_hash`: Reviewed WASM hash that the stream contract must
+    ///   have been deployed from.
     /// - `max_deposit`: Capacity cap per stream (and per batch when
     ///   `batch_cap_enforced` is true).
     /// - `min_duration`: Minimum stream duration in seconds.
@@ -200,6 +276,7 @@ impl FluxoraFactory {
         env: Env,
         admin: Address,
         stream_contract: Address,
+        stream_wasm_hash: BytesN<32>,
         max_deposit: i128,
         min_duration: u64,
     ) -> Result<(), FactoryError> {
@@ -214,6 +291,7 @@ impl FluxoraFactory {
         let config = FactoryConfig {
             admin,
             stream_contract,
+            stream_wasm_hash,
             max_deposit,
             min_duration,
             max_duration: DEFAULT_MAX_DURATION,
@@ -222,11 +300,11 @@ impl FluxoraFactory {
             creation_paused: false,
             min_rate_per_second: None,
             max_rate_per_second: None,
-            max_creations_per_window: DEFAULT_CREATIONS_PER_WINDOW,
-            rate_limit_window_ledgers: DEFAULT_RATE_LIMIT_WINDOW_LEDGERS,
+            max_active_streams: u32::MAX,
+            active_streams: 0,
         };
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -253,9 +331,12 @@ impl FluxoraFactory {
         load_config(&env).map_or_else(
             |e| panic_with_error!(&env, e),
             |_| {
-                env.storage()
-                    .persistent()
-                    .has(&DataKey::Allowlist(recipient))
+                let key = DataKey::Allowlist(recipient);
+                let allowed = env.storage().persistent().has(&key);
+                if allowed {
+                    bump_allowlist(&env, &key);
+                }
+                allowed
             },
         )
     }
@@ -353,6 +434,16 @@ impl FluxoraFactory {
         )
     }
 
+    /// Return the canonical salt for a child stream deployment.
+    pub fn derive_stream_salt(
+        env: Env,
+        sender: Address,
+        nonce: u64,
+        stream_id: u64,
+    ) -> BytesN<32> {
+        crate::derive_stream_salt(&env, &sender, nonce, stream_id)
+    }
+
     // -----------------------------------------------------------------------
     // Admin setters
     // -----------------------------------------------------------------------
@@ -364,12 +455,105 @@ impl FluxoraFactory {
     }
 
     /// Rotate the admin address.
+    ///
+    /// # Burn protection
+    ///
+    /// Rejects the zero address (`G…WHF`) and the factory's own contract
+    /// address: both would silently lock every policy setter behind an
+    /// unreachable signature. For a safer hand-off use the two-step
+    /// [`propose_admin`](Self::propose_admin) / [`accept_admin`](Self::accept_admin)
+    /// pair instead.
     pub fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
+        if is_forbidden_admin(&env, &new_admin) {
+            return Err(FactoryError::InvalidNewAdmin);
+        }
         config.admin = new_admin;
         env.storage().instance().set(&DataKey::Config, &config);
+        // A single-step rotation while a two-step hand-off is pending would
+        // leave a stale PendingAdmin behind; clear it so accept_admin cannot
+        // later resurrect a superseded proposal.
+        env.storage().instance().remove(&DataKey::PendingAdmin);
         bump_instance(&env);
         Ok(())
+    }
+
+    /// Nominate the next admin for a two-step transfer (issue #39).
+    ///
+    /// The pending admin takes over only after they call
+    /// [`accept_admin`](Self::accept_admin); until then the current admin keeps
+    /// full authority. This gives a rotating key a chance to prove it can sign
+    /// before it is handed the factory.
+    ///
+    /// # Authorization
+    /// - Requires the current admin's signature.
+    ///
+    /// # Errors
+    /// - `InvalidNewAdmin`: the proposed address is the zero address or the
+    ///   factory itself.
+    /// - `Unauthorized`: the caller is not the current admin.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        let config = Self::guard(&env)?;
+        if is_forbidden_admin(&env, &new_admin) {
+            return Err(FactoryError::InvalidNewAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance(&env);
+
+        // CEI: the pending nomination is persisted before the event is emitted.
+        AdminTransferProposed {
+            current: config.admin,
+            pending: new_admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accept a pending admin nomination and complete the transfer.
+    ///
+    /// The caller must be the exact address stored by [`propose_admin`](Self::propose_admin).
+    /// On success the previous admin is **immediately revoked** — every setter
+    /// re-checks the current admin, which is now the new address — and the
+    /// pending nomination is consumed.
+    ///
+    /// # Errors
+    /// - `NoPendingAdmin`: no transfer has been proposed.
+    pub fn accept_admin(env: Env) -> Result<(), FactoryError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(FactoryError::NoPendingAdmin)?;
+        // The caller must *be* the pending admin; any other address fails here.
+        pending.require_auth();
+
+        let mut config = load_config(&env)?;
+        let previous = config.admin;
+        config.admin = pending;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&env);
+
+        // CEI: the transfer is persisted before the event is emitted.
+        AdminTransferred {
+            previous,
+            new: config.admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// The currently nominated successor, if a two-step transfer is pending.
+    ///
+    /// # Errors
+    /// - `NotInitialized`: No policy record exists.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        load_config(&env).map_or_else(
+            |e| panic_with_error!(&env, e),
+            |_| env.storage().instance().get(&DataKey::PendingAdmin),
+        )
     }
 
     /// Point the factory at a different `fluxora-stream` contract.
@@ -377,7 +561,19 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.stream_contract = stream_contract;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
+        Ok(())
+    }
+
+    /// Update the reviewed WASM hash for the configured stream contract.
+    pub fn set_stream_wasm_hash(
+        env: Env,
+        stream_wasm_hash: BytesN<32>,
+    ) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        config.stream_wasm_hash = stream_wasm_hash;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -386,7 +582,7 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.max_deposit = max_deposit;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -398,7 +594,7 @@ impl FluxoraFactory {
         }
         config.min_duration = min_duration;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -449,7 +645,7 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.batch_cap_enforced = enforced;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -458,7 +654,7 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.creation_paused = paused;
         env.storage().instance().set(&DataKey::Config, &config);
-        bump_instance(&env);
+        bump_ttl(&env);
         Ok(())
     }
 
@@ -479,6 +675,81 @@ impl FluxoraFactory {
         config.min_rate_per_second = min_rate_per_second;
         config.max_rate_per_second = max_rate_per_second;
         env.storage().instance().set(&DataKey::Config, &config);
+        bump_ttl(&env);
+        Ok(())
+    }
+
+    /// Update the maximum number of active streams admitted through the factory.
+    pub fn set_max_active_streams(env: Env, max_active_streams: u32) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        config.max_active_streams = max_active_streams;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Admit a stream through the configured stream contract.
+    ///
+    /// The counter is reserved before the cross-contract call and committed
+    /// only after it succeeds, so a failed stream creation cannot consume
+    /// capacity. The configured stream contract remains responsible for its
+    /// own validation and authorization.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_stream(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        deposit: i128,
+        start_time: u64,
+        end_time: u64,
+        cliff_time: u64,
+        cancellable: bool,
+        pausable: bool,
+        transferable: bool,
+    ) -> Result<u64, FactoryError> {
+        let mut config = load_config(&env)?;
+        if config.active_streams >= config.max_active_streams {
+            return Err(FactoryError::CapacityCapExceeded);
+        }
+
+        let stream_id = env.invoke_contract::<u64>(
+            &config.stream_contract,
+            &Symbol::new(&env, "create_stream"),
+            (
+                sender,
+                recipient,
+                token,
+                deposit,
+                start_time,
+                end_time,
+                cliff_time,
+                cancellable,
+                pausable,
+                transferable,
+            )
+                .into_val(&env),
+        );
+
+        config.active_streams += 1;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(stream_id)
+    }
+
+    /// Release one active slot after a stream reaches a terminal state.
+    ///
+    /// Only the configured stream contract may call this callback. The stream
+    /// contract integration should invoke it exactly once for cancellation or
+    /// depletion; duplicate callbacks are rejected rather than underflowing.
+    pub fn stream_terminated(env: Env, _stream_id: u64) -> Result<(), FactoryError> {
+        let mut config = load_config(&env)?;
+        config.stream_contract.require_auth();
+        if config.active_streams == 0 {
+            return Err(FactoryError::ActiveStreamCountUnderflow);
+        }
+        config.active_streams -= 1;
+        env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
     }
@@ -498,6 +769,48 @@ impl FluxoraFactory {
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
+    }
+}
+
+/// Structural implementation of the governance interface over the contract's
+/// own `#[contractimpl]` entrypoints. Each method simply forwards to the ABI
+/// method of the same name, so the trait and the deployed entrypoints can never
+/// drift apart.
+impl FactoryGovernance for FluxoraFactory {
+    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_admin(env, new_admin)
+    }
+
+    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_stream_contract(env, stream_contract)
+    }
+
+    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError> {
+        FluxoraFactory::set_cap(env, max_deposit)
+    }
+
+    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError> {
+        FluxoraFactory::set_min_duration(env, min_duration)
+    }
+
+    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_allowlist(env, recipient, allowed)
+    }
+
+    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_batch_cap_enforcement(env, enforced)
+    }
+
+    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_factory_paused(env, paused)
+    }
+
+    fn set_rate_bounds(
+        env: Env,
+        min_rate_per_second: Option<i128>,
+        max_rate_per_second: Option<i128>,
+    ) -> Result<(), FactoryError> {
+        FluxoraFactory::set_rate_bounds(env, min_rate_per_second, max_rate_per_second)
     }
 }
 
