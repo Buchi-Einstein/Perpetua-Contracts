@@ -59,6 +59,13 @@ pub struct Proposal {
     pub calldata: Bytes,
     /// List of co-signer addresses that have approved this proposal.
     pub approvals: Vec<Address>,
+    /// Total accumulated voting weight of all approvals so far (#48).
+    ///
+    /// Each approval adds its signer's *assigned* voting weight (default 1). The
+    /// sum is accumulated with `checked_add` at approval time, so it is
+    /// overflow-safe and snapshots the weights in effect when each approval was
+    /// cast — a later `set_vote_weight` does not retroactively change quorum.
+    pub approval_weight: u64,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
     /// True once `execute` has been called successfully.
@@ -124,6 +131,9 @@ pub enum DataKey {
     Signers,
     /// Minimum approval threshold (instance storage).
     Threshold,
+    /// Assigned voting weight per signer (instance storage). Absent signers
+    /// default to weight 1 (#48).
+    SignerWeights,
     /// Monotonic proposal ID counter (instance storage).
     NextProposalId,
     /// Persistent record for a proposal (persistent storage, keyed by ID).
@@ -493,6 +503,17 @@ fn checked_deadline(start: u64, seconds: u64) -> Result<u64, GovernanceError> {
         .ok_or(GovernanceError::ArithmeticOverflow)
 }
 
+/// Return the voting weight assigned to a signer (#48). Unset signers (and
+/// non-signers) default to weight 1 so the pre-`#48` equal-vote behaviour is
+/// preserved unless the admin explicitly assigns different weights.
+fn signer_weight(env: &Env, signer: &Address) -> u64 {
+    env.storage()
+        .instance()
+        .get::<DataKey, Map<Address, u64>>(&DataKey::SignerWeights)
+        .and_then(|m| m.get(signer.clone()))
+        .unwrap_or(1u64)
+}
+
 fn increment_proposal_id(env: &Env) -> Result<u32, GovernanceError> {
     let id = read_next_proposal_id(env);
     let next = id
@@ -647,6 +668,48 @@ impl FluxoraGovernance {
         );
 
         Ok(())
+    }
+
+    /// Assign a voting weight to a co-signer (#48).
+    ///
+    /// A signer's voting weight is added to the proposal's running approval
+    /// weight every time they approve. The default weight is 1, so this is an
+    /// opt-in escalation model: an admin can give a trusted signer more than
+    /// one vote's worth of power, or zero to make them purely advisory.
+    ///
+    /// The accumulated weight of an in-flight proposal is snapshotted at each
+    /// approval, so changing a weight here does *not* retroactively change the
+    /// quorum status of proposals that have already collected approvals.
+    ///
+    /// # Authorization
+    /// - Requires the current admin signature.
+    ///
+    /// # Errors
+    /// - `NotASigner`: `signer` is not registered in the signer set.
+    pub fn set_vote_weight(env: Env, signer: Address, weight: u64) -> Result<(), GovernanceError> {
+        get_admin(&env)?.require_auth();
+        if !Self::is_registered_signer(&env, &signer)? {
+            return Err(GovernanceError::NotASigner);
+        }
+        let mut weights = env
+            .storage()
+            .instance()
+            .get::<DataKey, Map<Address, u64>>(&DataKey::SignerWeights)
+            .unwrap_or_else(|| Map::new(&env));
+        weights.set(signer.clone(), weight);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Return the voting weight assigned to `signer` (#48).
+    ///
+    /// Returns 1 (the default) for signers that have no explicit weight.
+    pub fn vote_weight(env: Env, signer: Address) -> u64 {
+        bump_instance(&env);
+        signer_weight(&env, &signer)
     }
 
     /// Add a co-signer to the governance set.
@@ -833,6 +896,7 @@ impl FluxoraGovernance {
             target: target.clone(),
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
+            approval_weight: 0,
             created_at: now,
             executed: false,
             cancelled: false,
@@ -855,12 +919,11 @@ impl FluxoraGovernance {
 
     /// Approve a proposal as a registered co-signer.
     ///
-    /// Each signer may approve at most once per proposal.  When the approval count
-    /// first reaches the configured threshold, the timelock clock starts.
-    ///
-    /// # Parameters
-    /// - `approver`: The co-signer casting their approval.
-    /// - `proposal_id`: The proposal to approve.
+    /// Each signer may approve at most once per proposal.  When the accumulated
+    /// approval *weight* first reaches the configured threshold, quorum is
+    /// recorded (starting the timelock). Because every signer defaults to a
+    /// weight of 1, the pre-`#48` headcount behaviour is unchanged unless the
+    /// admin assigns weighted powers via [`set_vote_weight`](Self::set_vote_weight).
     ///
     /// # Authorization
     /// - Requires `approver.require_auth()`.
@@ -870,7 +933,9 @@ impl FluxoraGovernance {
     /// - `ProposalNotFound`: No proposal with this ID.
     /// - `AlreadyExecuted`: Proposal has already been executed.
     /// - `AlreadyApproved`: This signer already approved this proposal.
-    /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot be represented.
+    /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot
+    ///   be represented, or accumulating this signer's vote weight would
+    ///   overflow `u64` (the approval is rejected without any state change).
     pub fn approve(env: Env, approver: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         approver.require_auth();
 
@@ -899,12 +964,30 @@ impl FluxoraGovernance {
             return Err(GovernanceError::AlreadyApproved);
         }
 
+        // Accumulate this approver's voting weight with `checked_add` so the
+        // running total can never wrap (#48). On overflow the approval is
+        // rejected *before* any state is written (all checks precede effects).
+        let weight = signer_weight(&env, &approver);
+        let accumulated = proposal
+            .approval_weight
+            .checked_add(weight)
+            .ok_or(GovernanceError::ArithmeticOverflow)?;
+
         proposal.approvals.push_back(approver.clone());
+        proposal.approval_weight = accumulated;
         approval_idx.set(approver.clone(), true);
         let approval_count = proposal.approvals.len();
 
         let threshold = get_threshold(&env)?;
-        let quorum_reached = if approval_count == threshold {
+        // Quorum is decided by *weight*, not headcount: the proposal reaches
+        // quorum once accumulated weight >= threshold. It is recorded only the
+        // first time (the QuorumReachedAt entry acts as a single-fire flag) so
+        // additional signers cannot re-trigger the timelock (#48).
+        let quorum_recorded = env
+            .storage()
+            .persistent()
+            .has(&DataKey::QuorumReachedAt(proposal_id));
+        let quorum_reached = if !quorum_recorded && accumulated >= threshold as u64 {
             let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             Some((now, executable_after))
@@ -994,9 +1077,9 @@ impl FluxoraGovernance {
             return Err(GovernanceError::ProposalExpired);
         }
 
-        // Verify quorum was reached and use the recorded threshold (snapshot at
-        // quorum time) so that in-flight proposals are immune to mid-flight
-        // threshold changes.
+        // Verify quorum was reached by weight and use the recorded threshold (snapshot
+        // at quorum time) so that in-flight proposals are immune to mid-flight
+        // threshold changes (#48).
         let quorum_info: QuorumInfo = env
             .storage()
             .persistent()
@@ -1004,7 +1087,7 @@ impl FluxoraGovernance {
             .ok_or(GovernanceError::QuorumNotReached)?;
         bump_quorum_ttl(&env, proposal_id);
 
-        if proposal.approvals.len() < quorum_info.threshold {
+        if proposal.approval_weight < quorum_info.threshold as u64 {
             return Err(GovernanceError::QuorumNotReached);
         }
 
@@ -1186,7 +1269,7 @@ impl FluxoraGovernance {
     /// 2. Not cancelled.
     /// 3. Not already executed.
     /// 4. Not expired.
-    /// 5. Quorum has been reached (approvals >= threshold snapshot).
+    /// 5. Quorum has been reached (accumulated approval weight >= threshold snapshot).
     /// 6. Timelock has elapsed (`now >= executable_after`).
     ///
     /// # Parameters
@@ -1234,7 +1317,7 @@ impl FluxoraGovernance {
             None => return Ok(false),
         };
 
-        if proposal.approvals.len() < quorum_info.threshold {
+        if proposal.approval_weight < quorum_info.threshold as u64 {
             return Ok(false);
         }
 
@@ -2887,5 +2970,135 @@ mod tests {
             ctx.client.try_execute(&executor, &id3),
             Err(Ok(GovernanceError::ProposalExpired))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Voting power / proof-of-weight (#48)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_vote_weight_defaults_to_one() {
+        let ctx = Ctx::setup();
+        assert_eq!(ctx.client.vote_weight(&ctx.signer_a), 1);
+        assert_eq!(ctx.client.vote_weight(&ctx.signer_b), 1);
+    }
+
+    #[test]
+    fn test_set_vote_weight_updates_value() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &5u64);
+        assert_eq!(ctx.client.vote_weight(&ctx.signer_a), 5);
+        // Other signers keep the default.
+        assert_eq!(ctx.client.vote_weight(&ctx.signer_b), 1);
+    }
+
+    #[test]
+    fn test_set_vote_weight_requires_admin_auth() {
+        // No mock_all_auths → the admin require_auth fails at host level.
+        let env = Env::default();
+        env.ledger().set_timestamp(1_000_000);
+        let contract_id = env.register_contract(None, FluxoraGovernance);
+        let admin = Address::generate(&env);
+        let signer_a = Address::generate(&env);
+        let signer_b = Address::generate(&env);
+        let client = FluxoraGovernanceClient::new(&env, &contract_id);
+        client.init(&admin, &vec![&env, signer_a.clone(), signer_b], &1u32);
+        assert!(client.try_set_vote_weight(&signer_a, &3u64).is_err());
+        assert_eq!(client.vote_weight(&signer_a), 1);
+    }
+
+    #[test]
+    fn test_set_vote_weight_requires_registered_signer() {
+        let ctx = Ctx::setup();
+        let outsider = Address::generate(&ctx.env);
+        let result = ctx.client.try_set_vote_weight(&outsider, &9u64);
+        assert_eq!(result, Err(Ok(GovernanceError::NotASigner)));
+    }
+
+    #[test]
+    fn test_weight_accumulation_is_checked_add() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &u64::MAX);
+        ctx.client.set_vote_weight(&ctx.signer_b, &u64::MAX);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("w"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        // a alone has weight u64::MAX ≥ threshold(2) → quorum already reached.
+        assert_eq!(ctx.client.get_proposal(&id).approval_weight, u64::MAX);
+        assert!(ctx.client.get_quorum_info(&id).is_some());
+
+        // b adding another u64::MAX would overflow — must fail safely and leave
+        // *no* trace of b's approval.
+        let result = ctx.client.try_approve(&ctx.signer_b, &id);
+        assert_eq!(result, Err(Ok(GovernanceError::ArithmeticOverflow)));
+
+        let p = ctx.client.get_proposal(&id);
+        assert_eq!(p.approvals.len(), 1, "rejected approval must not be recorded");
+        assert_eq!(p.approval_weight, u64::MAX, "accumulated weight must be unchanged");
+    }
+
+    #[test]
+    fn test_weighted_signer_reaches_quorum_with_single_approval() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &3u64);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("w"));
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        // Threshold is 2; a single weighted approval crosses it.
+        assert_eq!(ctx.client.get_proposal(&id).approval_weight, 3);
+        assert!(
+            ctx.client.get_quorum_info(&id).is_some(),
+            "one weighted approval must be enough to reach quorum"
+        );
+
+        // And the proposal is executable after the timelock.
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK + 1);
+        let executor = Address::generate(&ctx.env);
+        assert!(ctx.client.try_execute(&executor, &id).is_ok());
+        assert!(ctx.client.get_proposal(&id).executed);
+    }
+
+    #[test]
+    fn test_default_weight_single_approval_does_not_reach_quorum() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("w"));
+        ctx.client.approve(&ctx.signer_a, &id);
+        // Default weight 1 < threshold 2.
+        assert_eq!(ctx.client.get_proposal(&id).approval_weight, 1);
+        assert!(ctx.client.get_quorum_info(&id).is_none());
+        // Second (default-weight) signer crosses it.
+        ctx.client.approve(&ctx.signer_b, &id);
+        assert_eq!(ctx.client.get_proposal(&id).approval_weight, 2);
+        assert!(ctx.client.get_quorum_info(&id).is_some());
+    }
+
+    #[test]
+    fn test_quorum_single_fire_with_weighted_approvals() {
+        let ctx = Ctx::setup();
+        ctx.client.set_vote_weight(&ctx.signer_a, &2u64);
+        ctx.client.set_vote_weight(&ctx.signer_b, &2u64);
+
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("w"));
+        ctx.client.approve(&ctx.signer_a, &id);
+
+        let first = ctx.client.get_quorum_info(&id).expect("quorum recorded");
+        ctx.client.approve(&ctx.signer_b, &id);
+
+        // Extra weight beyond quorum must not restart the timelock.
+        let again = ctx.client.get_quorum_info(&id).expect("quorum still recorded");
+        assert_eq!(
+            again.reached_at, first.reached_at,
+            "quorum timestamp must not be re-written once recorded"
+        );
+        assert_eq!(ctx.client.get_proposal(&id).approval_weight, 4);
     }
 }
