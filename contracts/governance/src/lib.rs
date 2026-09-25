@@ -41,6 +41,22 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Lifecycle state of a governance proposal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Created, but no signer has approved it yet.
+    Proposed,
+    /// At least one signer has approved it, but quorum has not been reached.
+    Approved,
+    /// Quorum has been reached and the proposal is waiting for its timelock.
+    Queued,
+    /// The proposal was executed successfully.
+    Executed,
+    /// The proposal was cancelled and is permanently terminal.
+    Cancelled,
+}
+
 /// Persistent record of a governance proposal.
 ///
 /// `calldata` is stored as an opaque `Bytes` payload whose interpretation is
@@ -61,6 +77,8 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
+    /// Authoritative lifecycle state.
+    pub status: ProposalStatus,
     /// True once `execute` has been called successfully.
     pub executed: bool,
     /// True once `cancel_proposal` has been called. Terminal — no further
@@ -113,6 +131,8 @@ pub enum GovernanceError {
     CalldataEmpty = 19,
     /// Proposal calldata failed to decode into a known `CallData` variant.
     InvalidCalldata = 20,
+    /// The requested operation is not legal for the proposal's current state.
+    InvalidProposalState = 21,
 }
 
 /// Storage keys for the governance contract.
@@ -843,6 +863,7 @@ impl FluxoraGovernance {
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
             created_at: now,
+            status: ProposalStatus::Proposed,
             executed: false,
             cancelled: false,
         };
@@ -890,11 +911,11 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
-        }
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
+        match proposal.status {
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Queued => return Err(GovernanceError::InvalidProposalState),
+            ProposalStatus::Proposed | ProposalStatus::Approved => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -916,8 +937,10 @@ impl FluxoraGovernance {
         let quorum_reached = if approval_count == threshold {
             let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
+            proposal.status = ProposalStatus::Queued;
             Some((now, executable_after))
         } else {
+            proposal.status = ProposalStatus::Approved;
             None
         };
 
@@ -991,11 +1014,13 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
-        }
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
+        match proposal.status {
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Proposed | ProposalStatus::Approved => {
+                return Err(GovernanceError::QuorumNotReached)
+            }
+            ProposalStatus::Queued => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -1025,6 +1050,7 @@ impl FluxoraGovernance {
         }
 
         // CEI: mark as executed before emitting the event.
+        proposal.status = ProposalStatus::Executed;
         proposal.executed = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
@@ -1074,11 +1100,10 @@ impl FluxoraGovernance {
 
         let mut proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.executed {
-            return Err(GovernanceError::AlreadyExecuted);
-        }
-        if proposal.cancelled {
-            return Err(GovernanceError::ProposalCancelled);
+        match proposal.status {
+            ProposalStatus::Executed => return Err(GovernanceError::AlreadyExecuted),
+            ProposalStatus::Cancelled => return Err(GovernanceError::ProposalCancelled),
+            ProposalStatus::Proposed | ProposalStatus::Approved | ProposalStatus::Queued => {}
         }
 
         // Only the original proposer or the admin may cancel.
@@ -1087,6 +1112,7 @@ impl FluxoraGovernance {
             return Err(GovernanceError::NotProposerOrAdmin);
         }
 
+        proposal.status = ProposalStatus::Cancelled;
         proposal.cancelled = true;
         save_proposal(&env, proposal_id, &proposal);
         bump_instance(&env);
@@ -1109,6 +1135,23 @@ impl FluxoraGovernance {
     /// Read a proposal by ID.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernanceError> {
         load_proposal(&env, proposal_id)
+    }
+
+    /// Return the current lifecycle state of a proposal.
+    pub fn get_proposal_status(
+        env: Env,
+        proposal_id: u32,
+    ) -> Result<ProposalStatus, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.status)
+    }
+
+    /// Return whether a proposal is currently in the requested lifecycle state.
+    pub fn is_proposal_in_status(
+        env: Env,
+        proposal_id: u32,
+        expected: ProposalStatus,
+    ) -> Result<bool, GovernanceError> {
+        Ok(load_proposal(&env, proposal_id)?.status == expected)
     }
 
     /// Return the number of proposals created so far.
@@ -1215,11 +1258,10 @@ impl FluxoraGovernance {
     pub fn is_executable(env: Env, proposal_id: u32) -> Result<bool, GovernanceError> {
         let proposal = load_proposal(&env, proposal_id)?;
 
-        if proposal.cancelled {
-            return Ok(false);
-        }
-        if proposal.executed {
-            return Ok(false);
+        match proposal.status {
+            ProposalStatus::Cancelled | ProposalStatus::Executed => return Ok(false),
+            ProposalStatus::Proposed | ProposalStatus::Approved => return Ok(false),
+            ProposalStatus::Queued => {}
         }
         if env.ledger().timestamp()
             > checked_deadline(proposal.created_at, MAX_PROPOSAL_AGE_SECONDS)?
@@ -2007,9 +2049,68 @@ mod tests {
         let p = ctx.client.get_proposal(&id);
         assert_eq!(p.proposer, ctx.signer_a);
         assert_eq!(p.target, target);
+        assert_eq!(p.status, ProposalStatus::Proposed);
         assert!(!p.executed);
         assert!(!p.cancelled);
         assert_eq!(p.approvals.len(), 0);
+    }
+
+    #[test]
+    fn test_proposal_status_lifecycle_and_illegal_transitions() {
+        let ctx = Ctx::setup();
+        let id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("lifecycle"));
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Proposed);
+        assert!(ctx.client.is_proposal_in_status(&id, &ProposalStatus::Proposed));
+
+        ctx.client.approve(&ctx.signer_a, &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Approved);
+
+        ctx.client.approve(&ctx.signer_b, &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Queued);
+        assert_eq!(
+            ctx.client.try_approve(&ctx.signer_c, &id),
+            Err(Ok(GovernanceError::InvalidProposalState))
+        );
+
+        ctx.env.ledger().set_timestamp(1_000_000 + TIMELOCK);
+        ctx.client.execute(&Address::generate(&ctx.env), &id);
+        assert_eq!(ctx.client.get_proposal_status(&id), ProposalStatus::Executed);
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &id),
+            Err(Ok(GovernanceError::AlreadyExecuted))
+        );
+
+        let cancelled_id = ctx
+            .client
+            .propose(&ctx.signer_a, &ctx.dummy_target(), &ctx.calldata("cancel"));
+        ctx.client.cancel_proposal(&ctx.signer_a, &cancelled_id);
+        assert_eq!(
+            ctx.client.get_proposal_status(&cancelled_id),
+            ProposalStatus::Cancelled
+        );
+        assert_eq!(
+            ctx.client.try_approve(&ctx.signer_b, &cancelled_id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+        assert_eq!(
+            ctx.client.try_execute(&Address::generate(&ctx.env), &cancelled_id),
+            Err(Ok(GovernanceError::ProposalCancelled))
+        );
+    }
+
+    #[test]
+    fn test_status_helpers_reject_unknown_proposal() {
+        let ctx = Ctx::setup();
+        assert_eq!(
+            ctx.client.try_get_proposal_status(&99),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            ctx.client.try_is_proposal_in_status(&99, &ProposalStatus::Proposed),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
     }
 
     #[test]
