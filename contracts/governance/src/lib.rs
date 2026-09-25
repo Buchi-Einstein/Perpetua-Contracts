@@ -83,6 +83,13 @@ pub struct Proposal {
     pub calldata: Bytes,
     /// List of co-signer addresses that have approved this proposal.
     pub approvals: Vec<Address>,
+    /// Total accumulated voting weight of all approvals so far (#48).
+    ///
+    /// Each approval adds its signer's *assigned* voting weight (default 1). The
+    /// sum is accumulated with `checked_add` at approval time, so it is
+    /// overflow-safe and snapshots the weights in effect when each approval was
+    /// cast — a later `set_vote_weight` does not retroactively change quorum.
+    pub approval_weight: u64,
     /// Ledger timestamp at which the proposal was submitted.
     pub created_at: u64,
     /// Authoritative lifecycle state.
@@ -557,6 +564,17 @@ fn checked_deadline(start: u64, seconds: u64) -> Result<u64, GovernanceError> {
         .ok_or(GovernanceError::ArithmeticOverflow)
 }
 
+/// Return the voting weight assigned to a signer (#48). Unset signers (and
+/// non-signers) default to weight 1 so the pre-`#48` equal-vote behaviour is
+/// preserved unless the admin explicitly assigns different weights.
+fn signer_weight(env: &Env, signer: &Address) -> u64 {
+    env.storage()
+        .instance()
+        .get::<DataKey, Map<Address, u64>>(&DataKey::SignerWeights)
+        .and_then(|m| m.get(signer.clone()))
+        .unwrap_or(1u64)
+}
+
 fn increment_proposal_id(env: &Env) -> Result<u32, GovernanceError> {
     let id = read_next_proposal_id(env);
     let next = id
@@ -739,6 +757,48 @@ impl FluxoraGovernance {
         );
 
         Ok(())
+    }
+
+    /// Assign a voting weight to a co-signer (#48).
+    ///
+    /// A signer's voting weight is added to the proposal's running approval
+    /// weight every time they approve. The default weight is 1, so this is an
+    /// opt-in escalation model: an admin can give a trusted signer more than
+    /// one vote's worth of power, or zero to make them purely advisory.
+    ///
+    /// The accumulated weight of an in-flight proposal is snapshotted at each
+    /// approval, so changing a weight here does *not* retroactively change the
+    /// quorum status of proposals that have already collected approvals.
+    ///
+    /// # Authorization
+    /// - Requires the current admin signature.
+    ///
+    /// # Errors
+    /// - `NotASigner`: `signer` is not registered in the signer set.
+    pub fn set_vote_weight(env: Env, signer: Address, weight: u64) -> Result<(), GovernanceError> {
+        get_admin(&env)?.require_auth();
+        if !Self::is_registered_signer(&env, &signer)? {
+            return Err(GovernanceError::NotASigner);
+        }
+        let mut weights = env
+            .storage()
+            .instance()
+            .get::<DataKey, Map<Address, u64>>(&DataKey::SignerWeights)
+            .unwrap_or_else(|| Map::new(&env));
+        weights.set(signer.clone(), weight);
+        env.storage()
+            .instance()
+            .set(&DataKey::SignerWeights, &weights);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Return the voting weight assigned to `signer` (#48).
+    ///
+    /// Returns 1 (the default) for signers that have no explicit weight.
+    pub fn vote_weight(env: Env, signer: Address) -> u64 {
+        bump_instance(&env);
+        signer_weight(&env, &signer)
     }
 
     /// Add a co-signer to the governance set.
@@ -928,6 +988,7 @@ impl FluxoraGovernance {
             target: target.clone(),
             calldata: calldata.clone(),
             approvals: Vec::new(&env),
+            approval_weight: 0,
             created_at: now,
             status: ProposalStatus::Proposed,
             executed: false,
@@ -951,12 +1012,11 @@ impl FluxoraGovernance {
 
     /// Approve a proposal as a registered co-signer.
     ///
-    /// Each signer may approve at most once per proposal.  When the approval count
-    /// first reaches the configured threshold, the timelock clock starts.
-    ///
-    /// # Parameters
-    /// - `approver`: The co-signer casting their approval.
-    /// - `proposal_id`: The proposal to approve.
+    /// Each signer may approve at most once per proposal.  When the accumulated
+    /// approval *weight* first reaches the configured threshold, quorum is
+    /// recorded (starting the timelock). Because every signer defaults to a
+    /// weight of 1, the pre-`#48` headcount behaviour is unchanged unless the
+    /// admin assigns weighted powers via [`set_vote_weight`](Self::set_vote_weight).
     ///
     /// # Authorization
     /// - Requires `approver.require_auth()`.
@@ -966,7 +1026,9 @@ impl FluxoraGovernance {
     /// - `ProposalNotFound`: No proposal with this ID.
     /// - `AlreadyExecuted`: Proposal has already been executed.
     /// - `AlreadyApproved`: This signer already approved this proposal.
-    /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot be represented.
+    /// - `ArithmeticOverflow`: proposal age or quorum timelock deadline cannot
+    ///   be represented, or accumulating this signer's vote weight would
+    ///   overflow `u64` (the approval is rejected without any state change).
     pub fn approve(env: Env, approver: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         approver.require_auth();
 
@@ -995,12 +1057,30 @@ impl FluxoraGovernance {
             return Err(GovernanceError::AlreadyApproved);
         }
 
+        // Accumulate this approver's voting weight with `checked_add` so the
+        // running total can never wrap (#48). On overflow the approval is
+        // rejected *before* any state is written (all checks precede effects).
+        let weight = signer_weight(&env, &approver);
+        let accumulated = proposal
+            .approval_weight
+            .checked_add(weight)
+            .ok_or(GovernanceError::ArithmeticOverflow)?;
+
         proposal.approvals.push_back(approver.clone());
+        proposal.approval_weight = accumulated;
         approval_idx.set(approver.clone(), true);
         let approval_count = proposal.approvals.len();
 
         let threshold = get_threshold(&env)?;
-        let quorum_reached = if approval_count == threshold {
+        // Quorum is decided by *weight*, not headcount: the proposal reaches
+        // quorum once accumulated weight >= threshold. It is recorded only the
+        // first time (the QuorumReachedAt entry acts as a single-fire flag) so
+        // additional signers cannot re-trigger the timelock (#48).
+        let quorum_recorded = env
+            .storage()
+            .persistent()
+            .has(&DataKey::QuorumReachedAt(proposal_id));
+        let quorum_reached = if !quorum_recorded && accumulated >= threshold as u64 {
             let now = env.ledger().timestamp();
             let executable_after = checked_deadline(now, GOVERNANCE_TIMELOCK_SECONDS)?;
             proposal.status = ProposalStatus::Queued;
@@ -1125,9 +1205,9 @@ impl FluxoraGovernance {
             return Err(GovernanceError::InvalidSignerGeneration);
         }
 
-        // Verify quorum was reached and use the recorded threshold (snapshot at
-        // quorum time) so that in-flight proposals are immune to mid-flight
-        // threshold changes.
+        // Verify quorum was reached by weight and use the recorded threshold (snapshot
+        // at quorum time) so that in-flight proposals are immune to mid-flight
+        // threshold changes (#48).
         let quorum_info: QuorumInfo = env
             .storage()
             .persistent()
@@ -1135,7 +1215,7 @@ impl FluxoraGovernance {
             .ok_or(GovernanceError::QuorumNotReached)?;
         bump_quorum_ttl(&env, proposal_id);
 
-        if proposal.approvals.len() < quorum_info.threshold {
+        if proposal.approval_weight < quorum_info.threshold as u64 {
             return Err(GovernanceError::QuorumNotReached);
         }
 
@@ -1451,7 +1531,7 @@ impl FluxoraGovernance {
     /// 2. Not cancelled.
     /// 3. Not already executed.
     /// 4. Not expired.
-    /// 5. Quorum has been reached (approvals >= threshold snapshot).
+    /// 5. Quorum has been reached (accumulated approval weight >= threshold snapshot).
     /// 6. Timelock has elapsed (`now >= executable_after`).
     ///
     /// # Parameters
@@ -1501,7 +1581,7 @@ impl FluxoraGovernance {
             None => return Ok(false),
         };
 
-        if proposal.approvals.len() < quorum_info.threshold {
+        if proposal.approval_weight < quorum_info.threshold as u64 {
             return Ok(false);
         }
 
