@@ -479,6 +479,48 @@ impl FluxoraFactory {
     }
 }
 
+/// Structural implementation of the governance interface over the contract's
+/// own `#[contractimpl]` entrypoints. Each method simply forwards to the ABI
+/// method of the same name, so the trait and the deployed entrypoints can never
+/// drift apart.
+impl FactoryGovernance for FluxoraFactory {
+    fn set_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_admin(env, new_admin)
+    }
+
+    fn set_stream_contract(env: Env, stream_contract: Address) -> Result<(), FactoryError> {
+        FluxoraFactory::set_stream_contract(env, stream_contract)
+    }
+
+    fn set_cap(env: Env, max_deposit: i128) -> Result<(), FactoryError> {
+        FluxoraFactory::set_cap(env, max_deposit)
+    }
+
+    fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError> {
+        FluxoraFactory::set_min_duration(env, min_duration)
+    }
+
+    fn set_allowlist(env: Env, recipient: Address, allowed: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_allowlist(env, recipient, allowed)
+    }
+
+    fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_batch_cap_enforcement(env, enforced)
+    }
+
+    fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError> {
+        FluxoraFactory::set_factory_paused(env, paused)
+    }
+
+    fn set_rate_bounds(
+        env: Env,
+        min_rate_per_second: Option<i128>,
+        max_rate_per_second: Option<i128>,
+    ) -> Result<(), FactoryError> {
+        FluxoraFactory::set_rate_bounds(env, min_rate_per_second, max_rate_per_second)
+    }
+}
+
 /// Extends the TTL of an allowlist entry when it is (re)written so a populated,
 /// actively-queried allowlist stays readable between admin rotations.
 fn bump_allowlist(env: &Env, key: &DataKey) {
