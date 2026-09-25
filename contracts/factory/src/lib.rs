@@ -30,6 +30,9 @@ use soroban_sdk::{
 /// that is merely read never bumps rent, by design — reads have no side effects.
 const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280;
 const INSTANCE_BUMP_AMOUNT: u32 = 120_960;
+const DEFAULT_CREATIONS_PER_WINDOW: u32 = 100;
+const DEFAULT_RATE_LIMIT_WINDOW_LEDGERS: u32 = 17_280;
+const DEFAULT_MAX_DURATION: u64 = 157_680_000;
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -44,6 +47,18 @@ pub enum DataKey {
     Config,
     /// Presence of an address under this key means it is allowlisted.
     Allowlist(Address),
+    /// Presence of a token address under this key means it is approved.
+    TokenAllowlist(Address),
+    /// Per-sender creation bucket.
+    RateLimit(Address),
+}
+
+/// Sliding-window bucket for one sender's factory creations.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitBucket {
+    pub window_start: u32,
+    pub creations: u32,
 }
 
 /// The full on-chain configuration record.
@@ -58,6 +73,8 @@ pub struct FactoryConfig {
     pub stream_contract: Address,
     pub max_deposit: i128,
     pub min_duration: u64,
+    /// Maximum stream duration in seconds.
+    pub max_duration: u64,
     /// When true, the batch creation path enforces `max_deposit` per stream
     /// (not merely per batch).
     pub batch_cap_enforced: bool,
@@ -67,6 +84,10 @@ pub struct FactoryConfig {
     pub min_rate_per_second: Option<i128>,
     /// Optional upper bound on the per-second stream rate, applied at creation.
     pub max_rate_per_second: Option<i128>,
+    /// Maximum creations per sender during `rate_limit_window_ledgers`.
+    pub max_creations_per_window: u32,
+    /// Number of ledgers in each sender rate-limit window.
+    pub rate_limit_window_ledgers: u32,
 }
 
 /// The policy view consumed by the stream-creation paths.
@@ -81,10 +102,13 @@ pub struct FactoryPolicy {
     pub stream_contract: Address,
     pub max_deposit: i128,
     pub min_duration: u64,
+    pub max_duration: u64,
     pub batch_cap_enforced: bool,
     pub creation_paused: bool,
     pub min_rate_per_second: Option<i128>,
     pub max_rate_per_second: Option<i128>,
+    pub max_creations_per_window: u32,
+    pub rate_limit_window_ledgers: u32,
 }
 
 /// Error codes for the factory contract.
@@ -100,6 +124,14 @@ pub enum FactoryError {
     Unauthorized = 3,
     /// The recipient is not allowlisted.
     AllowlistDenied = 4,
+    /// The token is not approved by governance.
+    TokenNotAllowed = 5,
+    /// The sender has exhausted its current creation window.
+    RateLimitExceeded = 6,
+    /// A rate-limit quota or window must be greater than zero.
+    InvalidRateLimit = 7,
+    /// The stream duration is outside the configured policy bounds.
+    InvalidDuration = 8,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +165,13 @@ pub fn load_policy(env: &Env) -> Result<FactoryPolicy, FactoryError> {
         stream_contract: config.stream_contract,
         max_deposit: config.max_deposit,
         min_duration: config.min_duration,
+        max_duration: config.max_duration,
         batch_cap_enforced: config.batch_cap_enforced,
         creation_paused: config.creation_paused,
         min_rate_per_second: config.min_rate_per_second,
         max_rate_per_second: config.max_rate_per_second,
+        max_creations_per_window: config.max_creations_per_window,
+        rate_limit_window_ledgers: config.rate_limit_window_ledgers,
     })
 }
 
@@ -172,17 +207,23 @@ impl FluxoraFactory {
             return Err(FactoryError::AlreadyInitialized);
         }
         admin.require_auth();
+        if min_duration > DEFAULT_MAX_DURATION {
+            return Err(FactoryError::InvalidDuration);
+        }
 
         let config = FactoryConfig {
             admin,
             stream_contract,
             max_deposit,
             min_duration,
+            max_duration: DEFAULT_MAX_DURATION,
             // Documented init defaults for the optional axes.
             batch_cap_enforced: true,
             creation_paused: false,
             min_rate_per_second: None,
             max_rate_per_second: None,
+            max_creations_per_window: DEFAULT_CREATIONS_PER_WINDOW,
+            rate_limit_window_ledgers: DEFAULT_RATE_LIMIT_WINDOW_LEDGERS,
         };
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
@@ -217,6 +258,88 @@ impl FluxoraFactory {
                     .has(&DataKey::Allowlist(recipient))
             },
         )
+    }
+
+    /// True if `token` is approved for stream creation.
+    ///
+    /// # Errors
+    /// - `NotInitialized`: No policy record exists.
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        load_config(&env).map_or_else(
+            |e| panic_with_error!(&env, e),
+            |_| {
+                env.storage()
+                    .persistent()
+                    .has(&DataKey::TokenAllowlist(token))
+            },
+        )
+    }
+
+    /// Validate a token before forwarding a stream-creation request.
+    pub fn validate_token(env: Env, token: Address) -> Result<(), FactoryError> {
+        load_config(&env)?;
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TokenAllowlist(token))
+        {
+            Ok(())
+        } else {
+            Err(FactoryError::TokenNotAllowed)
+        }
+    }
+
+    /// Validate a stream duration against the configured inclusive bounds.
+    pub fn validate_duration(
+        env: Env,
+        start_time: u64,
+        end_time: u64,
+    ) -> Result<(), FactoryError> {
+        let config = load_config(&env)?;
+        let duration = end_time
+            .checked_sub(start_time)
+            .ok_or(FactoryError::InvalidDuration)?;
+        if duration < config.min_duration || duration > config.max_duration {
+            return Err(FactoryError::InvalidDuration);
+        }
+        Ok(())
+    }
+
+    /// Record one sender creation and reject exhausted buckets.
+    ///
+    /// Creation wrappers must call this before invoking the stream contract.
+    /// The sender authorization binds the quota to the party that funds the
+    /// creation, while transaction atomicity prevents failed downstream calls
+    /// from consuming a slot.
+    pub fn record_creation(env: Env, sender: Address) -> Result<(), FactoryError> {
+        let config = load_config(&env)?;
+        sender.require_auth();
+
+        let key = DataKey::RateLimit(sender);
+        let current_ledger = env.ledger().sequence();
+        let mut bucket = env
+            .storage()
+            .persistent()
+            .get::<_, RateLimitBucket>(&key)
+            .unwrap_or(RateLimitBucket {
+                window_start: current_ledger,
+                creations: 0,
+            });
+
+        if current_ledger.saturating_sub(bucket.window_start)
+            >= config.rate_limit_window_ledgers
+        {
+            bucket.window_start = current_ledger;
+            bucket.creations = 0;
+        }
+        if bucket.creations >= config.max_creations_per_window {
+            return Err(FactoryError::RateLimitExceeded);
+        }
+
+        bucket.creations += 1;
+        env.storage().persistent().set(&key, &bucket);
+        bump_allowlist(&env, &key);
+        Ok(())
     }
 
     /// True when the factory is paused and stream creation is rejected.
@@ -270,7 +393,22 @@ impl FluxoraFactory {
     /// Update the minimum stream duration.
     pub fn set_min_duration(env: Env, min_duration: u64) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
+        if min_duration > config.max_duration {
+            return Err(FactoryError::InvalidDuration);
+        }
         config.min_duration = min_duration;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Update the maximum stream duration in seconds.
+    pub fn set_max_duration(env: Env, max_duration: u64) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        if max_duration < config.min_duration {
+            return Err(FactoryError::InvalidDuration);
+        }
+        config.max_duration = max_duration;
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
@@ -291,6 +429,21 @@ impl FluxoraFactory {
         Ok(())
     }
 
+    /// Add or remove a token from the approved-token allowlist.
+    ///
+    /// Removing a token that was never added is a safe no-op.
+    pub fn set_token_allowed(env: Env, token: Address, allowed: bool) -> Result<(), FactoryError> {
+        Self::guard(&env)?;
+        let key = DataKey::TokenAllowlist(token);
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+            bump_allowlist(&env, &key);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        Ok(())
+    }
+
     /// Toggle whether the batch creation path enforces the cap per stream.
     pub fn set_batch_cap_enforcement(env: Env, enforced: bool) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
@@ -300,13 +453,18 @@ impl FluxoraFactory {
         Ok(())
     }
 
-    /// Pause or unpause stream creation.
-    pub fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError> {
+    /// Pause or unpause all stream creation through the factory.
+    pub fn set_pause(env: Env, paused: bool) -> Result<(), FactoryError> {
         let mut config = Self::guard(&env)?;
         config.creation_paused = paused;
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
+    }
+
+    /// Backward-compatible alias for `set_pause`.
+    pub fn set_factory_paused(env: Env, paused: bool) -> Result<(), FactoryError> {
+        Self::set_pause(env, paused)
     }
 
     /// Set optional per-second rate bounds applied at stream creation.
@@ -320,6 +478,23 @@ impl FluxoraFactory {
         let mut config = Self::guard(&env)?;
         config.min_rate_per_second = min_rate_per_second;
         config.max_rate_per_second = max_rate_per_second;
+        env.storage().instance().set(&DataKey::Config, &config);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Configure the per-sender creation bucket.
+    pub fn set_rate_limit(
+        env: Env,
+        max_creations_per_window: u32,
+        rate_limit_window_ledgers: u32,
+    ) -> Result<(), FactoryError> {
+        let mut config = Self::guard(&env)?;
+        if max_creations_per_window == 0 || rate_limit_window_ledgers == 0 {
+            return Err(FactoryError::InvalidRateLimit);
+        }
+        config.max_creations_per_window = max_creations_per_window;
+        config.rate_limit_window_ledgers = rate_limit_window_ledgers;
         env.storage().instance().set(&DataKey::Config, &config);
         bump_instance(&env);
         Ok(())
