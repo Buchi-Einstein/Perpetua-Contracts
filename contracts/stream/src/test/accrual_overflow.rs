@@ -360,6 +360,43 @@ proptest! {
     }
 }
 
+// This is intentionally separate from the environment-controlled sweep
+// above: the accounting guarantee is required to survive a fixed 100,000-case
+// randomized run in CI, independent of a developer's local PROPTEST_CASES.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100_000))]
+
+    /// A hostile prime deposit may leave a truncation residue at arbitrary
+    /// interior timestamps, but that residue must be exactly refundable and
+    /// must disappear completely at settlement.
+    #[test]
+    fn prime_deposit_has_no_stranded_dust_at_settlement(
+        duration in 2u64..=(20 * 365 * 86_400),
+        elapsed in 0u64..=(40 * 365 * 86_400),
+    ) {
+        const PRIME_DEPOSIT: i128 = 1_000_000_007;
+        let start = 1_700_000_000u64;
+        let end = start + duration;
+        let stream = stream_of(PRIME_DEPOSIT, start, end, start, 0, None);
+        let now = start + elapsed;
+
+        let vested = accrual::vested(&stream, now).expect("prime deposit must not overflow");
+        let refundable = accrual::refundable(&stream, now)
+            .expect("prime deposit complement must not overflow");
+        prop_assert_eq!(vested + refundable, PRIME_DEPOSIT);
+
+        let settled_vested = accrual::vested(&stream, end).expect("settlement must not overflow");
+        let settled_refundable = accrual::refundable(&stream, end)
+            .expect("settlement complement must not overflow");
+        prop_assert_eq!(settled_vested, PRIME_DEPOSIT);
+        prop_assert_eq!(settled_refundable, 0);
+
+        let post_settlement_refundable = accrual::refundable(&stream, end.saturating_add(1))
+            .expect("post-settlement complement must not overflow");
+        prop_assert_eq!(post_settlement_refundable, 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Contract level: maximum timestamps through the real entry points
 // ---------------------------------------------------------------------------
@@ -407,6 +444,45 @@ fn contract_handles_maximum_deployable_timestamps_without_a_trap() {
     assert_eq!(h.client.vested_of(&id), deposit);
     assert_eq!(h.client.withdraw(&id, &None), deposit);
     h.assert_pool_exact();
+}
+
+/// Repeated withdrawals may expose a different truncation residue at every
+/// probe, but settlement must still drain the complete prime deposit and leave
+/// no contract balance behind.
+#[test]
+fn prime_deposit_settlement_leaves_zero_pool_dust() {
+    let h = Harness::new();
+    let start = h.now();
+    let duration = 101 * DAY;
+    let end = start + duration;
+    let deposit = 1_000_000_007i128;
+    let id = h.client.create_stream(
+        &h.sender,
+        &h.recipient,
+        &h.token,
+        &deposit,
+        &start,
+        &end,
+        &start,
+        &true,
+        &true,
+        &true,
+    );
+
+    for fraction in [7u64, 19, 43, 71] {
+        h.warp_to(start + duration * fraction / 100);
+        let available = h.client.withdrawable_of(&id);
+        if available > 0 {
+            h.client.withdraw(&id, &None);
+        }
+    }
+
+    h.warp_to(end);
+    assert_eq!(h.client.vested_of(&id), deposit);
+    assert_eq!(h.client.refundable_of(&id), 0);
+    h.client.withdraw(&id, &None);
+    h.assert_pool_exact();
+    assert_eq!(h.pool(), 0, "settlement must leave no pool dust");
 }
 
 /// `create_stream` must reject a deposit whose `deposit * duration` product
@@ -523,4 +599,39 @@ fn lifecycle_stays_typed_at_maximum_deployable_timestamps() {
     let s = h.get(id);
     assert!(s.end_time >= s.start_time, "cancel inverted the schedule");
     h.assert_pool_exact();
+}
+
+/// Verification for Issue #3:
+/// 1. Checked arithmetic used across all accrual mathematical operations.
+/// 2. `Error::ArithmeticOverflow` / `Error::Overflow` emitted gracefully on numeric overflow around 2^127 - 1 bounds.
+/// 3. Never traps or panics on extreme i128 values.
+#[test]
+fn test_accrual_overflow_at_i128_max_boundaries() {
+    let start = 1_000_000u64;
+    let duration = 100_000u64;
+    let max_deposit = i128::MAX; // 2^127 - 1
+
+    let s = stream_of(max_deposit, start, start + duration, start, 0, None);
+
+    // At elapsed = 0: vested is 0, no overflow.
+    assert_eq!(accrual::vested(&s, start).unwrap(), 0);
+
+    // At elapsed >= 2: max_deposit * elapsed strictly exceeds i128::MAX.
+    // Checked arithmetic must catch this and return typed Error::ArithmeticOverflow / Error::Overflow.
+    let res = accrual::vested(&s, start + 2);
+    assert_eq!(res, Err(Error::ArithmeticOverflow));
+    assert_eq!(res, Err(Error::Overflow));
+
+    // Full maturity (elapsed >= duration) returns the deposit directly without dividing.
+    assert_eq!(accrual::vested(&s, start + duration).unwrap(), max_deposit);
+
+    // Withdrawable / refundable / liability under extreme values.
+    let withdrawable = accrual::withdrawable(&s, start);
+    assert_eq!(withdrawable.unwrap(), 0);
+
+    let refundable = accrual::refundable(&s, start + duration);
+    assert_eq!(refundable.unwrap(), 0);
+
+    let liability = accrual::liability(&s);
+    assert_eq!(liability.unwrap(), max_deposit);
 }

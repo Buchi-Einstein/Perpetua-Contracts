@@ -119,7 +119,11 @@ Discriminants are ABI and are never renumbered; new variants are appended.
 | 11 | `StreamNotActive` | | 24 | `StreamIdExhausted` |
 | 12 | `StreamNotPaused` | | 25 | `TokenTransferFailed` |
 | 13 | `StreamAlreadyPaused` | | 26 | `TokenMissing` |
+| | | | 27 | `DelegateNotPermitted` |
+| | | | 28 | `DelegateExpired` |
 | | | | 29 | `MalformedStreamId` |
+| | | | 30 | `RepeatedTransfer` |
+| | | | 31 | `InvalidTopUp` |
 
 `TokenTransferFailed` (25) and `TokenMissing` (26) are **stable stream-level categories** for token sub-invocation failures. The token contract's internal error discriminant is intentionally discarded — forwarding it would produce a value clients decode against Perpetua's error table, yielding a silent misinterpretation. The raw diagnostic is visible in the failed transaction's `diagnosticEvents`.
 
@@ -187,6 +191,8 @@ is the snake_case event name, second is always `stream_id`.
 |---|---|---|
 | `stream_created` | `stream_id`, `sender`, `recipient` | `token`, `deposited`, `start_time`, `end_time`, `cliff_time`, `cancellable`, `pausable`, `transferable` |
 | `withdrawn` | `stream_id`, `recipient` | `amount`, `withdrawn`, `deposited`, `status` |
+
+`stream_created` is the bootstrap event indexers use to reconstruct a stream's initial state. It is the only source of the per-stream metadata needed to build a sender/recipient mapping before any later lifecycle event arrives.
 | `cancelled` | `stream_id`, `sender`, `recipient` | `refunded`, `vested`, `withdrawn`, `end_time` |
 | `paused` | `stream_id`, `sender` | `paused_at`, `paused_total` |
 | `resumed` | `stream_id`, `sender` | `paused_duration`, `paused_total` |
@@ -304,6 +310,75 @@ view calls combined into one derived figure (for example checking
 
 **2. Handle archived streams.** `stream_exists(id) == false` while
 `id < stream_count()` means the entry has been archived, not that it never
-existed. Surface a restore action rather than an error. See
-[KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) §1.
+existed. Surface a restore action rather than an error. The recovery workflow is:
+
+1. Check `stream_count()` and `stream_exists(id)` in one ledger snapshot.
+2. If `!stream_exists(id)` and `id < stream_count()`, treat it as archived.
+3. Tell the user the stream is archived and show a restore action.
+4. Re-submit the read or mutating call with a `RestoreFootprint` so the
+   persistent entry is recovered before retrying.
+5. After the restore succeeds, re-run the call and continue normally.
+
+See [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) §1.
+
+---
+
+## Cliff Vesting Semantics vs Delayed Start Schedules
+
+Perpetua enforces standard vesting semantics: `cliff_time` **gates** the payout; it does **not** delay the accrual schedule.
+
+### Step Entitlement at the Cliff Boundary
+
+- **Prior to the cliff (`now < cliff_time`, e.g. `cliff_time - 1`):** Entitlement is strictly `0`. Attempting to call `withdraw` returns `Error::NothingToWithdraw`.
+- **At the cliff instant (`now == cliff_time`):** The cliff gate opens in a single discrete step. The recipient becomes immediately entitled to all tokens accrued since `start_time` (i.e. `deposited * (cliff_time - start_time) / (end_time - start_time)`), not merely what would accrue during the single second since `cliff_time - 1`.
+- **Post-cliff continuous accrual (`now > cliff_time`):** Accrual proceeds linearly from `start_time` to `end_time` at the constant per-second rate.
+
+### Comparison: Cliff Schedule vs Delayed Start Schedule
+
+| Dimension | Cliff Schedule (`cliff_time > start_time`) | Delayed Start Schedule (`start_time > creation_time`) |
+|---|---|---|
+| Accrual Origin | Accrues continuously starting from `start_time` | Accrual begins only when `start_time` arrives |
+| Payout Availability | Locked at `0` until `cliff_time` is reached | Locked at `0` until `start_time` is reached |
+| Entitlement at Release | Lump-sum step: $(cliff\_time - start\_time) \times rate$ | `0` at start instant; accrues linearly thereafter |
+| Post-Release Pace | Continues continuous accrual at original rate | Continues continuous accrual at original rate |
+
+### Developer Integration Example
+
+```typescript
+// Example: Creating and verifying a cliff-gated stream with the Perpetua SDK
+import { PerpetuaClient } from "@perpetua/sdk";
+
+// 1. Create a stream with a 90-day cliff on a 360-day schedule
+const startTime = Math.floor(Date.now() / 1000);
+const cliffTime = startTime + 90 * 86400; // 90-day cliff
+const endTime = startTime + 360 * 86400;   // 360-day total duration
+const deposit = 1200_0000000n;            // 1,200 tokens (7 decimals)
+
+const streamId = await client.createStream({
+  sender: senderAddress,
+  recipient: recipientAddress,
+  token: tokenAddress,
+  deposit,
+  startTime,
+  endTime,
+  cliffTime,
+  cancellable: true,
+  pausable: true,
+  transferable: true,
+});
+
+// 2. Querying entitlement before the cliff
+// At cliffTime - 1: withdrawable amount is 0
+const preCliff = await client.withdrawableOf(streamId, { timestamp: cliffTime - 1 });
+console.log(`Withdrawable before cliff: ${preCliff}`); // Output: 0
+
+// 3. Querying entitlement at the cliff instant
+// At cliffTime: recipient can withdraw 1/4 of total deposit (90 / 360) = 300 tokens
+const atCliff = await client.withdrawableOf(streamId, { timestamp: cliffTime });
+console.log(`Withdrawable at cliff: ${atCliff}`); // Output: 300_0000000n
+
+// 4. Executing withdrawal at cliff instant
+const tx = await client.withdraw(streamId);
+console.log(`Withdrawn: ${tx.amount}`); // Successfully claims 300 tokens
+```
 
