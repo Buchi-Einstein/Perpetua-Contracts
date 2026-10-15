@@ -118,6 +118,93 @@ because `latestLedger` is right there in every response. It costs one field
 check. Treating a single URL as a single node is an assumption you are making
 either way — this just makes it explicit and cheap to stop making.
 
+## Frontend SDK guidance: poll until the target ledger
+
+If your app submits a Soroban transaction and immediately reads contract state,
+add a barrier. In practice, this means polling `getLatestLedger()` until the
+node is at or beyond the target ledger for your write, then reading the stream
+state. Treat that read as the boundary between "write not yet visible" and
+"safe to display".
+
+The pattern is simple:
+
+1. Submit the transaction.
+2. Wait for the transaction to be included in a ledger.
+3. Poll `getLatestLedger()` until it reaches or passes the ledger sequence you
+   just observed.
+4. Read the contract state only after that boundary.
+5. If the ledger still lags, retry instead of deriving a number from stale data.
+
+### TypeScript example
+
+```ts
+import type { rpc as SorobanRpc } from '@stellar/stellar-sdk';
+
+async function waitForLedger(
+  rpc: SorobanRpc.Server,
+  targetLedger: number,
+  { maxAttempts = 40, pollMs = 1000 } = {},
+): Promise<number> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const latest = await rpc.getLatestLedger();
+    if (latest.sequence >= targetLedger) {
+      return latest.sequence;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  throw new Error(
+    `RPC did not reach ledger ${targetLedger} after ${maxAttempts} attempts`,
+  );
+}
+
+async function readStreamAfterWrite(
+  rpc: SorobanRpc.Server,
+  txHash: string,
+  contract: { read: (args?: any[]) => Promise<any> },
+) {
+  const tx = await rpc.getTransaction(txHash);
+  const includedLedger = tx?.resultMeta?.v3?.sorobanTransactionMeta?.sorobanMeta?.ledger
+    ?? tx?.resultMeta?.v3?.ledger;
+
+  if (typeof includedLedger !== 'number') {
+    throw new Error(`Transaction ${txHash} is not yet included in a ledger`);
+  }
+
+  await waitForLedger(rpc, includedLedger, { maxAttempts: 40, pollMs: 1000 });
+  return contract.read();
+}
+```
+
+The precise `tx.resultMeta` field names can vary slightly by SDK version, but the
+idea is stable: read the included ledger from the transaction result, then wait
+for the node to advance to that sequence before querying state.
+
+### React / frontend pattern
+
+```ts
+async function refreshStreamState() {
+  const tx = await submitStreamTransaction();
+  const latestLedger = await rpc.getLatestLedger();
+
+  // Poll until the node is at least as far as the write's ledger.
+  while ((await rpc.getLatestLedger()).sequence < tx.ledgerSequence) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  return rpc.getContractValue({
+    contractId: STREAM_CONTRACT_ID,
+    key: 'stream',
+    // or whichever view your app uses
+  });
+}
+```
+
+If your UI reads the stream immediately after a top-up, withdrawal or claim,
+this barrier is the difference between a stale read and a correct one. The rate
+of accrual is not the only thing that can drift between ledgers — the node you
+read from can also still be behind the one that included your transaction.
+
 ## What to do
 
 These are ordered by preference. The first one makes the problem structurally
