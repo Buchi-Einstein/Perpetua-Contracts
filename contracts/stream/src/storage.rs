@@ -85,12 +85,27 @@ pub const SECONDS_PER_LEDGER: u64 = 5;
 /// otherwise archive.
 pub const TTL_BUFFER_SECONDS: u64 = 30 * 24 * 60 * 60;
 
+/// Safety margin applied to the 30-day minimum TTL to absorb ledger-close drift.
+///
+/// The network does not close every ledger at exactly 5s; actual close time can
+/// drift above or below that nominal value. Using a small headroom means a
+/// nominal 30-day floor still remains well above 30 days in wall-clock terms if
+/// the network slows to around 5.2s/ledger, while also giving the keeper a bit
+/// of slack when the network is slightly faster than expected.
+pub const LEDGER_DRIFT_SAFETY_MULTIPLIER_NUMERATOR: u64 = 11;
+pub const LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR: u64 = 10;
+
 /// Floor for any stream entry's TTL, in ledgers, regardless of how little
-/// lifetime the stream has left. Roughly 30 days at the nominal close time.
+/// lifetime the stream has left. Roughly 30 days at the nominal close time,
+/// with a 10% headroom to absorb drift.
 ///
 /// A settled stream still has to stay readable: the recipient may not have
 /// withdrawn their tail yet, and the indexer needs to see the final state.
-pub const MIN_STREAM_TTL_LEDGERS: u32 = (TTL_BUFFER_SECONDS / SECONDS_PER_LEDGER) as u32;
+pub const MIN_STREAM_TTL_LEDGERS: u32 = ((TTL_BUFFER_SECONDS
+    * LEDGER_DRIFT_SAFETY_MULTIPLIER_NUMERATOR
+    + (LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR - 1))
+    / LEDGER_DRIFT_SAFETY_MULTIPLIER_DENOMINATOR
+    / SECONDS_PER_LEDGER) as u32;
 
 /// Convert a wall-clock duration into a ledger count, rounding up.
 ///
