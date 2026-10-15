@@ -49,6 +49,11 @@
 //! **I5 — Pause coherence.** `paused_at.is_some()` if and only if
 //! `status == Paused`, and while paused the clock does not advance.
 //!
+//! **I6 — Zero dust at settlement.** For every `t >= end_time`,
+//! `vested(t) == deposited` and `refundable(t) == 0`. Any truncation residue
+//! that exists strictly before maturity is therefore part of the sender's
+//! refundable complement and cannot remain stranded after settlement.
+//!
 //! ## Why I3 is the dangerous one
 //!
 //! I2 is the obvious property and is easy to get right. **I3 is the one that
@@ -139,6 +144,17 @@ pub fn elapsed(stream: &Stream, now: u64) -> u64 {
 ///
 /// The gate is evaluated against the stream clock, so a stream paused across
 /// its cliff does not silently pass the cliff while frozen.
+///
+/// # Cliff Semantics vs Delayed Start
+///
+/// A cliff is a payout gate, NOT a delayed start schedule:
+/// - At `now < cliff_time` (e.g. `cliff_time - 1`), the cliff gate is closed
+///   and vested entitlement is strictly zero (`0`).
+/// - At `now == cliff_time`, the gate opens in a single discrete step, immediately
+///   releasing all value accrued continuously since `start_time` (not merely since
+///   `cliff_time`).
+/// - Subsequent to `cliff_time`, accrual continues linearly along the original
+///   schedule rate until `end_time`.
 pub fn cliff_reached(stream: &Stream, now: u64) -> bool {
     stream_time(stream, now) >= stream.cliff_time
 }
@@ -152,6 +168,8 @@ pub fn cliff_reached(stream: &Stream, now: u64) -> bool {
 /// Before the cliff this is zero — the cliff *gates* the payout, it does not
 /// delay accrual, so at the cliff instant the recipient becomes entitled to
 /// everything accrued since `start_time`, not since `cliff_time`.
+/// Returns `Err(Error::Overflow)` (aka `Error::ArithmeticOverflow`) if any checked
+/// mathematical operation overflows.
 pub fn vested(stream: &Stream, now: u64) -> Result<i128, Error> {
     if !cliff_reached(stream, now) {
         return Ok(0);
@@ -169,6 +187,10 @@ pub fn vested(stream: &Stream, now: u64) -> Result<i128, Error> {
     }
 
     let consumed = elapsed(stream, now);
+    // Maturity is an exact terminal boundary. Returning the original deposit
+    // here, instead of evaluating the ratio at the boundary, makes the
+    // zero-dust consequence explicit even when the duration does not divide
+    // the deposit cleanly.
     if consumed >= total_duration {
         return Ok(stream.deposited);
     }
@@ -206,7 +228,9 @@ pub fn withdrawable(stream: &Stream, now: u64) -> Result<i128, Error> {
 
 /// Amount still locked for the recipient's future: deposited minus vested.
 ///
-/// This is what the sender gets back if they cancel at `now`.
+/// This is what the sender gets back if they cancel at `now`. Because this is
+/// the exact complement of [`vested`], all pre-maturity truncation residue is
+/// accounted for, and it is zero at and after maturity.
 pub fn refundable(stream: &Stream, now: u64) -> Result<i128, Error> {
     let earned = vested(stream, now)?;
     stream.deposited.checked_sub(earned).ok_or(Error::Overflow)
